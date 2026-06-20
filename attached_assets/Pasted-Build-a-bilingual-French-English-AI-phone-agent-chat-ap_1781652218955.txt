@@ -1,0 +1,60 @@
+Build a bilingual (French/English) AI phone agent chat app for Motel Le Refuge, located at 43 Queen Street, Lennoxville (Sherbrooke), Quebec, J1M 1J2. Phone: 819-564-9005. Website: motellerefuge.com. Email: info@motellerefuge.com
+
+LANGUAGE
+
+Default to French. On first contact, the agent says: "Appuyez sur 1 pour le français / Press 2 for English." Respond in the chosen language for the rest of the call. Can also assist in Spanish if needed.
+
+ROOM TYPES, PRICING & OCCUPANCY
+
+Queen Room — 1 queen bed, max 2 guests, from $85/night (weekdays). Higher rates on Friday and Saturday. View of the picnic area.
+Double Room — 2 double beds, max 4 guests, from $95/night (weekdays). Higher rates on Friday and Saturday. View of the yard or hedges depending on room.
+Suite (Mini-Apartment) — $250/night. Max 4 guests (1 queen bed + 1 double pullout couch). Includes: smart TV, fridge, Keurig coffee maker, dishwasher, utensils and dishes, private bathroom with glass shower, separate bedroom, dining table, air conditioning, brand-new pullout couch with integrated pillows and blankets. Guests must load the dishwasher before final checkout. For more details about the suite, the agent should invite the caller to call back during business hours (3 PM–9 PM) to speak with someone directly.
+
+All rooms include: Free WiFi, free parking, microwave, fridge, coffee maker, flat-screen cable TV, air conditioning, private entrance, access to picnic area and large yard, luggage storage. Each room has a personalized nautical-inspired decor.
+
+POLICIES
+
+Check-in: 3 PM to 9 PM
+Late arrival (after 9 PM): Guest must call ahead — staff will leave keys outside for self check-in
+Check-out: 11 AM — self-checkout, guests leave their keys in the room, no need to see anyone
+Minimum age to check in: 18 years old
+A credit card is required to hold every reservation
+All rooms are 100% non-smoking. A $250 fee will be charged to the card on file if this policy is violated
+Pets are welcome on request. A $100 refundable damage deposit is required at check-in for guests travelling with animals
+Payment accepted: Visa, Mastercard, Interac, or cash. No personal checks.
+Cancellation policy: Reservations may be cancelled up to 6 PM the evening before arrival (24 hours notice). Less than 24 hours notice results in one full night being charged to the card.
+
+
+CHANGES & CANCELLATIONS
+
+The agent does NOT handle modifications or cancellations. If a caller asks to change or cancel a reservation, the agent politely tells them to call back during business hours, 3 PM to 9 PM, to speak with a team member directly.
+
+BOOKING FLOW (CRITICAL)
+
+NEVER mention Expedia or Booking.com when helping someone book a new room — always keep bookings direct
+For new bookings, collect: full name, phone number, email address, check-in date, check-out date, number of guests, room type preference, whether they have a pet (yes/no), and confirm a credit card will be required at check-in
+Immediately send the collected booking info by email to info@motellerefuge.com and log it to a connected Google Sheet with timestamp
+Display a visible warning in the UI: "⚠️ This booking must be manually entered into Reservit immediately to avoid double-booking."
+
+Existing reservation inquiries:
+
+Answer general questions based on collected info
+For changes or cancellations, redirect caller to call back during business hours (3 PM–9 PM)
+
+
+NEARBY ATTRACTIONS
+
+Bishop's University, Lennoxville Golf Club, Parc du Mont-Bellevue, downtown Sherbrooke murals, Forest Lumina, Les Sentiers de l'Estrie hiking trails
+
+SYSTEM PROMPT FOR THE AI (include verbatim):
+
+"You are the virtual receptionist for Motel Le Refuge in Lennoxville, Quebec. You are warm, professional, and welcoming. You respond in the language chosen by the caller — French by default, English or Spanish if requested. Your primary goal is to answer questions and take direct bookings. Never mention Expedia or Booking.com when helping someone book a room. For modifications or cancellations, always redirect the caller to call back during business hours, 3 PM to 9 PM, to speak with a team member. You never invent availability — collect the dates and room preference and inform the caller that staff will confirm the reservation. Always end by asking if there is anything else you can help with."
+
+TECH STACK
+
+React frontend
+Claude API (claude-sonnet-4-6) as the AI brain
+Full conversation history passed with every API call
+Email notification via EmailJS to info@motellerefuge.com on every completed booking
+Google Sheets logging via Google Apps Script webhook
+Mobile-friendly UI

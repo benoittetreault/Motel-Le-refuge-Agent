@@ -1,0 +1,31 @@
+kind = "web"
+previewPath = "/"
+title = "Motel Le Refuge — AI Receptionist"
+version = "1.0.0"
+id = "artifacts/motel-refuge"
+router = "path"
+
+[[integratedSkills]]
+name = "react-vite"
+version = "1.0.0"
+
+[[services]]
+name = "web"
+paths = [ "/" ]
+localPort = 19679
+
+[services.development]
+run = "pnpm --filter @workspace/motel-refuge run dev"
+
+[services.production]
+build = [ "pnpm", "--filter", "@workspace/motel-refuge", "run", "build" ]
+publicDir = "artifacts/motel-refuge/dist/public"
+serve = "static"
+
+[[services.production.rewrites]]
+from = "/*"
+to = "/index.html"
+
+[services.env]
+PORT = "19679"
+BASE_PATH = "/"

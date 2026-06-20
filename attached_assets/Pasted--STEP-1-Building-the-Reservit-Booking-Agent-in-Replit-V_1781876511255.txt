@@ -1,0 +1,202 @@
+# STEP 1: Building the Reservit Booking Agent in Replit
+## Version 2 Automation — Pre-Filled Booking Links
+
+---
+
+## Overview
+
+Your agent needs to:
+1. Listen for guest questions about availability
+2. Extract dates and occupancy from their message
+3. Generate a pre-filled Reservit booking URL
+4. Return the link to the guest
+
+**This is NOT full automation yet.** The guest still completes the booking on Reservit's site. But they get a link with all their details pre-filled.
+
+---
+
+## The Architecture
+
+```
+Guest Message
+    ↓
+Claude extracts: dates, month, nights, adults
+    ↓
+Generate Reservit URL with those parameters
+    ↓
+Agent returns: "Here's your booking link: [URL]"
+    ↓
+Guest clicks → lands on Reservit with dates pre-filled → books
+```
+
+---
+
+## Your Replit Code Structure
+
+### **File: server.js (or index.js)**
+
+This is where you call the Claude API. Here's the flow:
+
+```javascript
+// 1. USER SENDS MESSAGE
+const userMessage = "Do you have a room for 2 people, June 25-27?";
+
+// 2. SEND TO CLAUDE WITH SYSTEM PROMPT
+const response = await fetch("https://api.anthropic.com/v1/messages", {
+  method: "POST",
+  headers: {
+    "Content-Type": "application/json",
+    "x-api-key": process.env.ANTHROPIC_API_KEY
+  },
+  body: JSON.stringify({
+    model: "claude-opus-4-8",
+    max_tokens: 1024,
+    system: `You are the AI receptionist for Motel Le Refuge...
+    
+    ## Reservit Booking Integration
+    
+    When a guest asks about availability, extract:
+    - fday (arrival day 1-31)
+    - fmonth (arrival month 1-12)
+    - nbnights (number of nights)
+    - nbadt (number of adults)
+    
+    Then generate this exact URL format:
+    http://softbooker.reservit.com/reservit/reserhotel.php?lang=EN&hotelid=444801&fday=DD&fmonth=MM&fyear=2026&nbnights=NN&nbadt=ZZ
+    
+    Example:
+    Guest: "2 people, June 25-27"
+    Extract: fday=25, fmonth=06, nbnights=2, nbadt=2
+    URL: http://softbooker.reservit.com/reservit/reserhotel.php?lang=EN&hotelid=444801&fday=25&fmonth=06&fyear=2026&nbnights=2&nbadt=2
+    
+    Response: "Great! Here's your booking link with those dates pre-filled:
+    [INSERT URL HERE]
+    Click to complete your booking!"`,
+    
+    messages: [
+      { role: "user", content: userMessage }
+    ]
+  })
+});
+
+// 3. CLAUDE RETURNS RESPONSE WITH URL
+const claudeResponse = response.content[0].text;
+// Output: "Great! Here's your booking link: http://softbooker.reservit.com/..."
+
+// 4. SEND TO GUEST
+return claudeResponse;
+```
+
+---
+
+## What Claude Will Do Automatically
+
+Once you add the Reservit instructions to the system prompt, Claude will:
+
+✅ **Parse guest requests** like "2 people, June 25-27"
+✅ **Extract the data** (day, month, nights, guests)
+✅ **Build the correct URL** with all parameters
+✅ **Return it in a friendly format** 
+
+**Example conversation:**
+
+```
+Guest: "Do you have availability for 2 people from June 25-27?"
+
+Claude thinks:
+- fday = 25 (June 25th)
+- fmonth = 06 (June)
+- nbnights = 2 (June 25 to 27 is 2 nights)
+- nbadt = 2 (2 adults)
+
+Claude generates:
+http://softbooker.reservit.com/reservit/reserhotel.php?lang=EN&hotelid=444801&fday=25&fmonth=06&fyear=2026&nbnights=2&nbadt=2
+
+Claude responds:
+"Perfect! I found availability for 2 guests, June 25-27. 
+Here's your booking link with those dates pre-filled:
+http://softbooker.reservit.com/reservit/reserhotel.php?lang=EN&hotelid=444801&fday=25&fmonth=06&fyear=2026&nbnights=2&nbadt=2
+
+Just click to see room options and complete your reservation!"
+```
+
+---
+
+## The Key Parameters Explained
+
+| Parameter | Example | What It Means |
+|-----------|---------|---------------|
+| `hotelid` | 444801 | YOUR motel ID (fixed) |
+| `fday` | 25 | Guest's arrival day |
+| `fmonth` | 06 | Guest's arrival month |
+| `fyear` | 2026 | Year (currently 2026) |
+| `nbnights` | 2 | How many nights they're staying |
+| `nbadt` | 2 | How many adults |
+| `lang` | EN | Language (EN for English, FR for French) |
+
+---
+
+## Testing STEP 1
+
+In your Replit chat, try these test messages:
+
+**Test 1 (English):**
+```
+"Hi, do you have a room available for 2 people from June 25 to June 27?"
+```
+
+**Expected response:**
+```
+Great! I found availability for 2 guests from June 25-27. 
+Here's your booking link:
+http://softbooker.reservit.com/reservit/reserhotel.php?lang=EN&hotelid=444801&fday=25&fmonth=06&fyear=2026&nbnights=2&nbadt=2
+```
+
+**Test 2 (French):**
+```
+"Bonjour, avez-vous de la disponibilité pour 4 personnes du 10 au 12 juillet?"
+```
+
+**Expected response (in French):**
+```
+Parfait! J'ai trouvé une disponibilité pour 4 clients du 10 au 12 juillet.
+Voici votre lien de réservation:
+http://softbooker.reservit.com/reservit/reserhotel.php?lang=FR&hotelid=444801&fday=10&fmonth=07&fyear=2026&nbnights=2&nbadt=4
+```
+
+---
+
+## Important Notes
+
+✅ Claude will figure out the URL automatically from the system prompt
+✅ Claude handles date extraction (it understands "June 25-27" = 2 nights)
+✅ Claude handles both languages (English & French)
+✅ The guest still books on Reservit (we haven't automated that yet)
+✅ All booking data goes through Reservit's secure system
+
+---
+
+## Next Steps (STEP 2 - Later)
+
+Once STEP 1 works perfectly, we'll add:
+- SMS/Email delivery via Twilio
+- Validation of dates (no past dates)
+- Better error handling
+
+But first, make sure STEP 1 is working! Test it with several date combinations.
+
+---
+
+## Summary
+
+STEP 1 is complete when:
+✅ Agent extracts dates from guest message
+✅ Agent generates correct Reservit URL
+✅ Agent returns link in response
+✅ Guest can click link and see pre-filled booking
+
+You're essentially letting Claude be your "smart link generator" that understands natural language dates and builds correct URLs on the fly.
+
+---
+
+**Ready to test? Try one of the test messages above and show me the response!**

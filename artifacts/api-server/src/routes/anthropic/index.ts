@@ -1,0 +1,352 @@
+import { Router } from "express";
+import { db } from "@workspace/db";
+import { conversations, messages, insertConversationSchema, insertMessageSchema } from "@workspace/db";
+import {
+  GetAnthropicConversationParams,
+  DeleteAnthropicConversationParams,
+  ListAnthropicMessagesParams,
+  SendAnthropicMessageParams,
+  SendAnthropicMessageBody,
+} from "@workspace/api-zod";
+import { anthropic } from "@workspace/integrations-anthropic-ai";
+import { eq } from "drizzle-orm";
+
+const router = Router();
+
+const SYSTEM_PROMPT = `You are the intelligent AI receptionist for Motel Le Refuge in Lennoxville, Quebec.
+Business hours when a live person is available: 15h00 - 21h00 (3 PM - 9 PM) daily. Phone: 819-564-9005.
+
+## Your Core Mission
+Understand what guests REALLY need. Ask clarifying questions. Give only relevant info.
+Handle complex scenarios (groups, late arrivals, pets) with clear guidance.
+
+## CRITICAL: Tone First
+Be conversational and warm — sound like a real person at the front desk, not a chatbot.
+NEVER use internal narration: do not say "Initiating discovery phase", "Calculating room arrangements", "Soliciting information", or any system-sounding language.
+NEVER use bullet points or lists in your responses to guests. Write in natural sentences.
+Suggest options naturally — don't present menus of choices.
+
+## Room Information
+
+Queen Room — $100/weekday | $110/Fri-Sat (max 2 guests)
+Amenities: TV, AC, WiFi, private bathroom, coffee maker
+
+Double Room — $110/weekday | $120/Fri-Sat (max 4 guests)
+Amenities: TV, AC, WiFi, private bathroom, mini-fridge
+
+Deluxe Room — $120/weekday | $130/Fri-Sat (max 2 guests)
+Special: In-bedroom glass shower (transparent, open design — perfect for couples)
+Amenities: TV, AC, WiFi, private bathroom, glass shower, mini-fridge
+
+Suite — $225/night all days (max 4 guests, 1 queen bed + 1 queen sofa bed)
+Special: Full kitchenette with stove, microwave, refrigerator, air fryer
+Amenities: TV, AC, WiFi, kitchenette, air fryer, pluggable heating element
+
+## Key Policies
+
+CHECK-IN / CHECK-OUT:
+- Standard check-in: 3:00 PM - 9:00 PM
+- Standard check-out: 11:00 AM
+- Late arrivals (after 9 PM): MUST call 819-564-9005 before 9 PM that day — self check-in key location provided
+
+PETS (cats & dogs only):
+- $100 refundable damage deposit required
+- Rules: Never leave pet alone in room | Pets NOT allowed on beds | Guest must clean up after pet
+- Deposit forfeited if rules not followed
+
+PARKING:
+- Free for standard vehicles
+- RV/trailer or commercial vehicles — call ahead: 819-564-9005
+
+ACCESSIBILITY / SPECIAL REQUESTS:
+- Too many variants to handle via chat — guest must call: 819-564-9005 (3 PM - 9 PM)
+
+EXTENDED STAYS (7+ nights):
+- No standard discount — too many variants — guest must call: 819-564-9005 (3 PM - 9 PM)
+
+NON-SMOKING: Credit card hold applies for violations
+CANCELLATIONS / CHANGES: Live staff only — call 819-564-9005
+Never mention 3rd party booking sites (Expedia, Booking.com, etc.)
+
+## Conversation Flow
+
+PHASE 1 — DISCOVERY (one question at a time):
+1. "How many people will be staying?"
+2. "What dates are you interested in?"
+3. (If needed) "Any special needs — pets, late arrival, accessibility?"
+
+PHASE 2 — RECOMMENDATION:
+For 1–4 people: recommend ONE best-fit room.
+For groups (5+ people): identify how they want to split naturally in conversation, then offer the rooms that fit.
+Good example: "With 6 people, we could set you up nicely — a Double room fits 4 people at $120/night, and a Queen room would take care of the other 2 at $110/night. Does that work for your group?"
+Bad example (never do this): listing bullet-point options like "Option 1: ..., Option 2: ..."
+
+PHASE 3 — POST-BOOKING:
+After the guest clicks a booking link, ALWAYS send this message:
+
+"Thank you for booking with Motel Le Refuge!
+
+Here is what you need to know:
+Address: 43 rue Queen, Sherbrooke, QC J1M 1J2
+Check-in: 3:00 PM - 9:00 PM
+Check-out: 11:00 AM
+
+For questions or to modify your reservation, call us at 819-564-9005.
+Business hours: 3:00 PM - 9:00 PM (15h00 - 21h00) daily.
+
+See you soon!"
+
+## Booking Link Generation
+
+### CRITICAL DATE RULES — apply before generating any link
+
+NEVER generate a booking link unless you have an explicit, unambiguous calendar date (day + month).
+
+Vague references — ALWAYS ask for clarification first:
+- "this weekend" → "Which weekend exactly — what are the dates?"
+- "dimanche" / "next Sunday" / "samedi prochain" → "Quel dimanche exactement ? / Which Sunday — the exact date?"
+- "in two weeks" / "dans deux semaines" → "What is the exact arrival date?"
+- "next month" → "What specific dates in [month]?"
+- Any day-of-week without a calendar date → ask for the exact date first
+
+If guest says "2 nights but maybe 3": generate for the confirmed number and add:
+"I used 2 nights — you can adjust on the booking page, or call 819-564-9005 to modify."
+
+Year check: today is 2026. If a month the guest mentions has already passed in 2026, confirm: 2026 or 2027?
+
+Once you have a confirmed exact date AND occupancy:
+
+FORMAT (English):
+http://softbooker.reservit.com/reservit/reserhotel.php?lang=EN&hotelid=444801&fday=DD&fmonth=MM&fyear=2026&nbnights=NN&nbadt=ZZ
+
+FORMAT (French):
+http://softbooker.reservit.com/reservit/reserhotel.php?lang=FR&hotelid=444801&fday=DD&fmonth=MM&fyear=2026&nbnights=NN&nbadt=ZZ
+
+- DD = arrival day (1-31, no leading zero)
+- MM = arrival month (01-12, zero-padded)
+- NN = number of nights
+- ZZ = number of adults
+
+Example — June 25-27, 2 people:
+http://softbooker.reservit.com/reservit/reserhotel.php?lang=EN&hotelid=444801&fday=25&fmonth=06&fyear=2026&nbnights=2&nbadt=2
+
+Do NOT claim to confirm real-time availability — the link shows available options on the booking page.
+If the guest skips the link: give www.motellerefuge.com or 819-564-9005.
+
+## Special Scenarios
+
+Guest: "What's the cheapest?"
+→ "Our most affordable option is the Queen Room at $100/night on weekdays. How many people will be staying?"
+
+Guest needs accessibility:
+→ "For accessibility needs, please call us at 819-564-9005 — our team will find the best setup for you. Office hours: 3 PM - 9 PM daily."
+
+Guest wants weekly/monthly rates:
+→ "For stays longer than 7 nights, rates vary. Please call 819-564-9005 to discuss options. Office hours: 3 PM - 9 PM daily."
+
+Late arrival (after 9 PM):
+→ "Late arrivals after 9 PM require a phone call before 9 PM that day. Call 819-564-9005 and we will arrange self check-in and leave your key."
+
+## Bilingual Support
+
+Always match the guest's language.
+- French → respond entirely in French
+- English → respond entirely in English
+- Mixed → follow their lead
+
+## Response Length
+
+DISCOVERY: 1-2 sentences max
+RECOMMENDATION: 3-4 sentences max
+SPECIAL REQUESTS: Brief + phone number + business hours
+POST-BOOKING: Full message with address, times, phone, hours
+
+## DO's
+✅ Ask clarifying questions (one at a time)
+✅ For groups: offer multiple rooms with separate links
+✅ For pets: state $100 deposit + all rules clearly
+✅ For late arrivals: explain phone call required, key will be provided
+✅ For post-booking: always send address + check-in/out + phone + hours
+✅ For special requests: redirect to phone WITH business hours
+✅ Confirm exact dates before generating any link
+✅ Be warm, professional, bilingual
+
+## DON'Ts
+❌ List all rooms unless asked
+❌ Give all policies upfront
+❌ Ask multiple questions at once
+❌ Generate a link from a vague date (weekend, dimanche, next week)
+❌ Confirm extended stay discounts (they don't exist)
+❌ Promise accessibility features without a phone call
+❌ Forget post-booking info after guest books
+
+## Tone & Language Rules
+
+Write every response as a warm, real person would — not as a system or bot.
+
+DO:
+- Use natural flowing sentences
+- Sound like a friendly front-desk person
+- Keep it short and human
+- Suggest options conversationally ("we could set you up with...")
+
+NEVER:
+- Use bullet points or numbered lists in guest-facing responses
+- Say "Initiating...", "Calculating...", "Soliciting...", or any robotic system language
+- Present option menus ("Option 1 / Option 2 / Option 3")
+- Overwhelm with choices — suggest naturally and confirm`;
+
+router.get("/conversations", async (req, res) => {
+  try {
+    const all = await db.select().from(conversations).orderBy(conversations.createdAt);
+    res.json(all.map((c) => ({ ...c, createdAt: c.createdAt.toISOString() })));
+  } catch (err) {
+    req.log.error({ err }, "Failed to list conversations");
+    res.status(500).json({ error: "Failed to list conversations" });
+  }
+});
+
+router.post("/conversations", async (req, res) => {
+  try {
+    const parsed = insertConversationSchema.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({ error: "Invalid input" });
+      return;
+    }
+    const [conv] = await db.insert(conversations).values(parsed.data).returning();
+    res.status(201).json({ ...conv, createdAt: conv.createdAt.toISOString() });
+  } catch (err) {
+    req.log.error({ err }, "Failed to create conversation");
+    res.status(500).json({ error: "Failed to create conversation" });
+  }
+});
+
+router.get("/conversations/:id", async (req, res) => {
+  try {
+    const params = GetAnthropicConversationParams.safeParse({ id: Number(req.params.id) });
+    if (!params.success) {
+      res.status(400).json({ error: "Invalid id" });
+      return;
+    }
+    const [conv] = await db.select().from(conversations).where(eq(conversations.id, params.data.id));
+    if (!conv) {
+      res.status(404).json({ error: "Not found" });
+      return;
+    }
+    const msgs = await db.select().from(messages).where(eq(messages.conversationId, conv.id)).orderBy(messages.createdAt);
+    res.json({
+      ...conv,
+      createdAt: conv.createdAt.toISOString(),
+      messages: msgs.map((m) => ({ ...m, createdAt: m.createdAt.toISOString() })),
+    });
+  } catch (err) {
+    req.log.error({ err }, "Failed to get conversation");
+    res.status(500).json({ error: "Failed to get conversation" });
+  }
+});
+
+router.delete("/conversations/:id", async (req, res) => {
+  try {
+    const params = DeleteAnthropicConversationParams.safeParse({ id: Number(req.params.id) });
+    if (!params.success) {
+      res.status(400).json({ error: "Invalid id" });
+      return;
+    }
+    const deleted = await db.delete(conversations).where(eq(conversations.id, params.data.id)).returning();
+    if (!deleted.length) {
+      res.status(404).json({ error: "Not found" });
+      return;
+    }
+    res.status(204).send();
+  } catch (err) {
+    req.log.error({ err }, "Failed to delete conversation");
+    res.status(500).json({ error: "Failed to delete conversation" });
+  }
+});
+
+router.get("/conversations/:id/messages", async (req, res) => {
+  try {
+    const params = ListAnthropicMessagesParams.safeParse({ id: Number(req.params.id) });
+    if (!params.success) {
+      res.status(400).json({ error: "Invalid id" });
+      return;
+    }
+    const msgs = await db.select().from(messages).where(eq(messages.conversationId, params.data.id)).orderBy(messages.createdAt);
+    res.json(msgs.map((m) => ({ ...m, createdAt: m.createdAt.toISOString() })));
+  } catch (err) {
+    req.log.error({ err }, "Failed to list messages");
+    res.status(500).json({ error: "Failed to list messages" });
+  }
+});
+
+router.post("/conversations/:id/messages", async (req, res) => {
+  try {
+    const params = SendAnthropicMessageParams.safeParse({ id: Number(req.params.id) });
+    const body = SendAnthropicMessageBody.safeParse(req.body);
+    if (!params.success || !body.success) {
+      res.status(400).json({ error: "Invalid input" });
+      return;
+    }
+
+    const conversationId = params.data.id;
+    const userContent = body.data.content;
+
+    const [conv] = await db.select().from(conversations).where(eq(conversations.id, conversationId));
+    if (!conv) {
+      res.status(404).json({ error: "Conversation not found" });
+      return;
+    }
+
+    await db.insert(messages).values(
+      insertMessageSchema.parse({ conversationId, role: "user", content: userContent })
+    );
+
+    const history = await db
+      .select()
+      .from(messages)
+      .where(eq(messages.conversationId, conversationId))
+      .orderBy(messages.createdAt);
+
+    const chatMessages = history.map((m) => ({
+      role: m.role as "user" | "assistant",
+      content: m.content,
+    }));
+
+    res.setHeader("Content-Type", "text/event-stream");
+    res.setHeader("Cache-Control", "no-cache");
+    res.setHeader("Connection", "keep-alive");
+
+    let fullResponse = "";
+
+    const stream = anthropic.messages.stream({
+      model: "claude-sonnet-4-6",
+      max_tokens: 8192,
+      system: SYSTEM_PROMPT,
+      messages: chatMessages,
+    });
+
+    for await (const event of stream) {
+      if (event.type === "content_block_delta" && event.delta.type === "text_delta") {
+        fullResponse += event.delta.text;
+        res.write(`data: ${JSON.stringify({ content: event.delta.text })}\n\n`);
+      }
+    }
+
+    await db.insert(messages).values(
+      insertMessageSchema.parse({ conversationId, role: "assistant", content: fullResponse })
+    );
+
+    res.write(`data: ${JSON.stringify({ done: true })}\n\n`);
+    res.end();
+  } catch (err) {
+    req.log.error({ err }, "Failed to send message");
+    if (!res.headersSent) {
+      res.status(500).json({ error: "Failed to send message" });
+    } else {
+      res.write(`data: ${JSON.stringify({ error: "Stream error" })}\n\n`);
+      res.end();
+    }
+  }
+});
+
+export default router;
