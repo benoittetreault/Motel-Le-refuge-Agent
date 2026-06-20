@@ -1,8 +1,0 @@
-{
-  "build": {
-    "builder": "nixpacks"
-  },
-  "deploy": {
-    "startCommand": "pnpm install --no-frozen-lockfile && pnpm --filter @workspace/motel-refuge build && pnpm --filter @workspace/motel-refuge dev"
-  }
-}
