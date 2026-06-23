@@ -9,6 +9,9 @@ export const logger = pino({
     "req.headers.cookie",
     "res.headers['set-cookie']",
   ],
+  serializers: {
+    err: pino.stdSerializers.err,
+  },
   ...(isProduction
     ? {}
     : {
