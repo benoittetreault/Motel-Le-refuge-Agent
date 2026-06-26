@@ -13,7 +13,30 @@ import { eq } from "drizzle-orm";
 
 const router = Router();
 
-const SYSTEM_PROMPT = `You are the intelligent AI receptionist for Motel Le Refuge in Lennoxville, Quebec.
+function getCurrentDateContext(): string {
+  const now = new Date();
+  return new Intl.DateTimeFormat("en-CA", {
+    timeZone: "America/Montreal",
+    weekday: "long",
+    year: "numeric",
+    month: "long",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: true,
+  }).format(now);
+}
+
+function buildSystemPrompt(): string {
+  return `## CURRENT DATE & TIME (server-injected, Eastern Time — Sherbrooke, Quebec)
+Right now it is: ${getCurrentDateContext()}.
+This is the ONLY source of truth for "today's date" or "what year is it." You have no other way of knowing the current date — never guess, estimate, or rely on your own sense of time.
+If a guest states or implies a different "today" (e.g. "today is the 11th" when it is not), do NOT accept it as fact. Politely correct them using the date above before continuing — never use a guest-asserted date as authoritative for availability or booking calculations without checking it against the date above first.
+
+${SYSTEM_PROMPT_BODY}`;
+}
+
+const SYSTEM_PROMPT_BODY = `You are the intelligent AI receptionist for Motel Le Refuge in Lennoxville, Quebec.
 Business hours when a live person is available: 15h00 - 21h00 (3 PM - 9 PM) daily. Phone: 819-564-9005.
 
 ## Your Core Mission
@@ -128,7 +151,7 @@ Vague references — ALWAYS ask for clarification first:
 If guest says "2 nights but maybe 3": generate for the confirmed number and add:
 "I used 2 nights — you can adjust on the booking page, or call 819-564-9005 to modify."
 
-Year check: today is 2026. If a month the guest mentions has already passed in 2026, confirm: 2026 or 2027?
+Year check: use the server-injected current date above as the actual today's date and year. If a month the guest mentions has already passed this year, confirm which year they mean (this year or next).
 
 Once you have a confirmed exact date AND occupancy:
 
@@ -362,7 +385,7 @@ router.post("/conversations/:id/messages", async (req, res) => {
     const stream = anthropic.messages.stream({
       model: "claude-sonnet-4-6",
       max_tokens: 8192,
-      system: SYSTEM_PROMPT,
+      system: buildSystemPrompt(),
       messages: chatMessages,
     });
 
