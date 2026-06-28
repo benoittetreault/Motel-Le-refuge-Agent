@@ -10,6 +10,7 @@ import {
 } from "@workspace/api-zod";
 import { anthropic } from "@workspace/integrations-anthropic-ai";
 import { eq } from "drizzle-orm";
+import { checkAvailability } from "./availability";
 
 const router = Router();
 
@@ -258,7 +259,18 @@ NEVER:
 - Use bullet points or numbered lists in guest-facing responses
 - Say "Initiating...", "Calculating...", "Soliciting...", or any robotic system language
 - Present option menus ("Option 1 / Option 2 / Option 3")
-- Overwhelm with choices — suggest naturally and confirm`;
+- Overwhelm with choices — suggest naturally and confirm
+
+## Real-Time Availability (check_availability tool)
+
+When you have an exact arrival date, number of nights, and number of adults, and you are about to offer or generate a booking link, call check_availability FIRST. Never claim or imply that specific dates are available without having called this tool — do not guess from memory and do not assume.
+
+Respond to the result conversationally and concisely — never in bullet points or lists, and always in the guest's language:
+- all_available: proceed and generate the booking link exactly per the booking-link rules above, with no extra availability commentary.
+- partial: tell the guest concisely which dates are booked versus open, offer a link for the available stretch, and mention the team can help arrange the rest at 819-564-9005. For example: "Quick heads-up — July 3rd and 4th are fully booked, but the rest of your dates are open. I can set you up with a link for July 1st–2nd to start, and our team can help arrange the rest at 819-564-9005. Want me to do that?"
+- none_available: "Unfortunately those exact dates are fully booked. Would different dates work? Or you can call us at 819-564-9005 and we'll find the best option."
+- too_long: "For a stay that long, the best way is to call us directly at 819-564-9005 — our team will sort out the details with you."
+- check_failed: do NOT mention any error or that a check was attempted. Fall back to the normal behavior exactly — generate the link as usual and note that the booking page shows live availability.`;
 
 router.get("/conversations", async (req, res) => {
   try {
@@ -376,6 +388,79 @@ router.post("/conversations/:id/messages", async (req, res) => {
       content: m.content,
     }));
 
+    // ---- PHASE 1: non-streaming tool-decision pass ----
+    // Give the model one chance to call check_availability before we stream the
+    // guest-facing reply. This whole block is best-effort: if anything throws
+    // (the Anthropic call fails, a malformed tool_use block, etc.) we fall through
+    // to Phase 2 with the original, unmodified messages so the chat is never
+    // broken. Nothing here is written to the SSE stream — from the guest's point
+    // of view it's just a slightly longer pause before the reply starts.
+    type StreamMessages = Parameters<typeof anthropic.messages.stream>[0]["messages"];
+    let messagesForStream: StreamMessages = chatMessages;
+
+    try {
+      const toolDecision = await anthropic.messages.create({
+        model: "claude-sonnet-4-6",
+        max_tokens: 8192,
+        system: buildSystemPrompt(),
+        messages: chatMessages,
+        tools: [
+          {
+            name: "check_availability",
+            description:
+              "Check room availability for specific dates before generating a booking link. Call this whenever the guest has given an exact arrival date, number of nights, and number of adults.",
+            input_schema: {
+              type: "object",
+              properties: {
+                arrivalDate: { type: "string", description: "YYYY-MM-DD" },
+                nights: { type: "integer" },
+                adults: { type: "integer" },
+              },
+              required: ["arrivalDate", "nights", "adults"],
+            },
+          },
+        ],
+      });
+
+      if (toolDecision.stop_reason === "tool_use") {
+        const toolUse = toolDecision.content.find((block) => block.type === "tool_use");
+        if (toolUse && toolUse.type === "tool_use") {
+          const { arrivalDate, nights, adults } = toolUse.input as {
+            arrivalDate: string;
+            nights: number;
+            adults: number;
+          };
+          const result = await checkAvailability(arrivalDate, nights, adults);
+
+          messagesForStream = [
+            ...chatMessages,
+            // The SDK types response content (ContentBlock[]) differently from
+            // request content (ContentBlockParam[]), so cast when echoing it back.
+            {
+              role: "assistant",
+              content: toolDecision.content as unknown as StreamMessages[number]["content"],
+            },
+            {
+              role: "user",
+              content: [
+                {
+                  type: "tool_result",
+                  tool_use_id: toolUse.id,
+                  content: JSON.stringify(result),
+                },
+              ],
+            },
+          ];
+        }
+      }
+    } catch (err) {
+      // Second safety net around the tool-calling mechanics themselves (in
+      // addition to checkAvailability's own check_failed handling): never let a
+      // Phase 1 failure break or delay the chat beyond a normal reply.
+      req.log.error({ err }, "Availability tool phase failed; continuing without it");
+      messagesForStream = chatMessages;
+    }
+
     res.setHeader("Content-Type", "text/event-stream");
     res.setHeader("Cache-Control", "no-cache");
     res.setHeader("Connection", "keep-alive");
@@ -386,7 +471,7 @@ router.post("/conversations/:id/messages", async (req, res) => {
       model: "claude-sonnet-4-6",
       max_tokens: 8192,
       system: buildSystemPrompt(),
-      messages: chatMessages,
+      messages: messagesForStream,
     });
 
     for await (const event of stream) {
