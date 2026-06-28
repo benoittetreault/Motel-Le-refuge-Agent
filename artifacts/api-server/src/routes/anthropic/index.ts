@@ -28,13 +28,24 @@ function getCurrentDateContext(): string {
   }).format(now);
 }
 
-function buildSystemPrompt(): string {
+// Phase 1 (the non-streaming create() call) is the ONLY place the model actually
+// has the check_availability tool, so the "call the tool first" directive must
+// live only there. Including it in Phase 2 (the streaming call, which has no
+// tools array) is what made the model improvise fake <tool_call> text that
+// leaked to the guest. Keep this directive out of SYSTEM_PROMPT_BODY.
+const AVAILABILITY_TOOL_INSTRUCTION = `## Availability Tool — REQUIRED before any booking link
+When you have an exact arrival date, number of nights, and number of adults, and you are about to offer or generate a booking link, call the check_availability tool FIRST. Never claim or imply that specific dates are available without having called this tool — do not guess from memory and do not assume. (See "Responding to an availability check" for how to phrase each possible result.)`;
+
+function buildSystemPrompt(options?: { includeAvailabilityToolInstruction?: boolean }): string {
+  const toolInstruction = options?.includeAvailabilityToolInstruction
+    ? `\n\n${AVAILABILITY_TOOL_INSTRUCTION}`
+    : "";
   return `## CURRENT DATE & TIME (server-injected, Eastern Time — Sherbrooke, Quebec)
 Right now it is: ${getCurrentDateContext()}.
 This is the ONLY source of truth for "today's date" or "what year is it." You have no other way of knowing the current date — never guess, estimate, or rely on your own sense of time.
 If a guest states or implies a different "today" (e.g. "today is the 11th" when it is not), do NOT accept it as fact. Politely correct them using the date above before continuing — never use a guest-asserted date as authoritative for availability or booking calculations without checking it against the date above first.
 
-${SYSTEM_PROMPT_BODY}`;
+${SYSTEM_PROMPT_BODY}${toolInstruction}`;
 }
 
 const SYSTEM_PROMPT_BODY = `You are the intelligent AI receptionist for Motel Le Refuge in Lennoxville, Quebec.
@@ -228,7 +239,7 @@ POST-BOOKING: Full message with address, times, phone, hours
 
 ## DO's
 ✅ Ask clarifying questions (one at a time)
-✅ For groups: offer multiple rooms with separate links
+✅ For groups: help them decide how to split, then for 2+ separate rooms direct them to 819-564-9005 to confirm and book together (see Multiple Rooms) — don't hand out multiple "available" links
 ✅ For pets: state $100 deposit + all rules clearly
 ✅ For late arrivals: explain phone call required, key will be provided
 ✅ For post-booking: always send address + check-in/out + phone + hours
@@ -261,16 +272,18 @@ NEVER:
 - Present option menus ("Option 1 / Option 2 / Option 3")
 - Overwhelm with choices — suggest naturally and confirm
 
-## Real-Time Availability (check_availability tool)
+## Responding to an availability check
 
-When you have an exact arrival date, number of nights, and number of adults, and you are about to offer or generate a booking link, call check_availability FIRST. Never claim or imply that specific dates are available without having called this tool — do not guess from memory and do not assume.
-
-Respond to the result conversationally and concisely — never in bullet points or lists, and always in the guest's language:
+Once an availability check has been performed for the guest's dates, its result is provided to you. Respond conversationally and concisely — never in bullet points or lists, and always in the guest's language:
 - all_available: proceed and generate the booking link exactly per the booking-link rules above, with no extra availability commentary.
 - partial: tell the guest concisely which dates are booked versus open, offer a link for the available stretch, and mention the team can help arrange the rest at 819-564-9005. For example: "Quick heads-up — July 3rd and 4th are fully booked, but the rest of your dates are open. I can set you up with a link for July 1st–2nd to start, and our team can help arrange the rest at 819-564-9005. Want me to do that?"
 - none_available: "Unfortunately those exact dates are fully booked. Would different dates work? Or you can call us at 819-564-9005 and we'll find the best option."
 - too_long: "For a stay that long, the best way is to call us directly at 819-564-9005 — our team will sort out the details with you."
-- check_failed: do NOT mention any error or that a check was attempted. Fall back to the normal behavior exactly — generate the link as usual and note that the booking page shows live availability.`;
+- check_failed: do NOT mention any error or that a check was attempted. Fall back to the normal behavior exactly — generate the link as usual and note that the booking page shows live availability.
+
+## Multiple Rooms (group bookings needing 2+ rooms)
+
+Our availability check only verifies ONE room for one set of dates — it cannot verify availability across MULTIPLE rooms (e.g. a guest wanting 2 or 3 separate rooms of the same or different types). If a guest needs more than one room and you've confirmed how they want to split up, do NOT claim or imply that you've verified availability for all of those rooms, and do NOT generate multiple booking links presented as confirmed/available. Instead, say something concise like: "For multiple rooms, the best way to lock in availability across all of them is to call us at 819-564-9005 — our team can confirm everything at once and get you booked." This applies even if a single-room check happens to come back available — that result only covers one room, not the full group's need. (Single-room bookings are unaffected: keep handling those exactly as usual.)`;
 
 // Cheap pre-filter so we only spend a Phase 1 tool-decision round-trip when the
 // latest user message plausibly touches booking, dates, or occupancy. Biased
@@ -285,6 +298,89 @@ const BOOKING_KEYWORDS = [
 function mightInvolveBooking(text: string): boolean {
   const lower = text.toLowerCase();
   return BOOKING_KEYWORDS.some((kw) => lower.includes(kw));
+}
+
+// ---- Defense-in-depth: strip tool-call-imitation text from the stream ----
+// The real fix for the leak is the Phase 1/Phase 2 prompt split above; this is a
+// belt-and-suspenders layer in case the model ever invents some other pseudo
+// tool-call syntax. It removes <tool_call>…</tool_call> and
+// <tool_response>…</tool_response> blocks (case-insensitive) from the streamed
+// text. If it ever fires in production, that's a signal the prompt split didn't
+// fully hold — so callers log a warning when stripping occurs.
+const TOOL_TAGS = ["<tool_call>", "</tool_call>", "<tool_response>", "</tool_response>"];
+const TOOL_OPENING_TAGS = ["<tool_call>", "<tool_response>"];
+const LONGEST_TOOL_TAG = Math.max(...TOOL_TAGS.map((t) => t.length));
+const COMPLETE_TOOL_BLOCK_RE =
+  /<tool_call>[\s\S]*?<\/tool_call>|<tool_response>[\s\S]*?<\/tool_response>/gi;
+const DANGLING_CLOSE_TAG_RE = /<\/tool_(?:call|response)>/gi;
+
+// True if `s` is a non-empty prefix of any tool tag (so it could be the start of
+// a tag that is still arriving across future deltas).
+function isPartialToolTag(s: string): boolean {
+  if (!s) return false;
+  const lower = s.toLowerCase();
+  return TOOL_TAGS.some((tag) => tag.startsWith(lower));
+}
+
+// Given the buffered (not-yet-emitted) stream text, return the prefix that is
+// safe to send now (`flush`), the suffix to hold for later (`keep`, because it
+// is — or might become — a tool tag), and whether a complete block was removed.
+function sanitizeStreamBuffer(buffer: string): { flush: string; keep: string; stripped: boolean } {
+  let stripped = false;
+  const cleaned = buffer.replace(COMPLETE_TOOL_BLOCK_RE, () => {
+    stripped = true;
+    return "";
+  });
+
+  let holdFrom = cleaned.length;
+
+  // Hold from the earliest still-unclosed opening tag (its close may arrive later).
+  const lower = cleaned.toLowerCase();
+  for (const tag of TOOL_OPENING_TAGS) {
+    const idx = lower.indexOf(tag);
+    if (idx !== -1 && idx < holdFrom) holdFrom = idx;
+  }
+
+  // Hold from the earliest tail position that is a partial tool tag (a tag split
+  // across deltas). Such a position can only be within the last (LONGEST-1) chars.
+  const scanStart = Math.max(0, cleaned.length - LONGEST_TOOL_TAG);
+  for (let p = scanStart; p < holdFrom; p++) {
+    if (isPartialToolTag(cleaned.slice(p))) {
+      holdFrom = p;
+      break;
+    }
+  }
+
+  return { flush: cleaned.slice(0, holdFrom), keep: cleaned.slice(holdFrom), stripped };
+}
+
+// Final pass on whatever text was still held when the stream ended: remove any
+// complete blocks, drop a dangling unclosed opening tag (a hallucination cut off
+// mid-stream) and any stray close tag.
+function finalizeStreamBuffer(buffer: string): { text: string; stripped: boolean } {
+  let stripped = false;
+  let text = buffer.replace(COMPLETE_TOOL_BLOCK_RE, () => {
+    stripped = true;
+    return "";
+  });
+
+  const lower = text.toLowerCase();
+  let cut = -1;
+  for (const tag of TOOL_OPENING_TAGS) {
+    const idx = lower.indexOf(tag);
+    if (idx !== -1 && (cut === -1 || idx < cut)) cut = idx;
+  }
+  if (cut !== -1) {
+    text = text.slice(0, cut);
+    stripped = true;
+  }
+
+  text = text.replace(DANGLING_CLOSE_TAG_RE, () => {
+    stripped = true;
+    return "";
+  });
+
+  return { text, stripped };
 }
 
 router.get("/conversations", async (req, res) => {
@@ -422,7 +518,9 @@ router.post("/conversations/:id/messages", async (req, res) => {
         const toolDecision = await anthropic.messages.create({
           model: "claude-sonnet-4-6",
           max_tokens: 8192,
-          system: buildSystemPrompt(),
+          // Phase 1 is the only call with the tools array, so it's the only one
+          // that should carry the "call check_availability first" directive.
+          system: buildSystemPrompt({ includeAvailabilityToolInstruction: true }),
           messages: chatMessages,
           tools: [
             {
@@ -495,11 +593,40 @@ router.post("/conversations/:id/messages", async (req, res) => {
       messages: messagesForStream,
     });
 
+    // `pending` holds buffered text that might be (the start of) a tool-call tag
+    // and so is not yet safe to emit. In normal output it stays tiny — at most a
+    // few trailing chars that look like the start of "<tool_call>".
+    let pending = "";
+    let sanitizationFired = false;
+
     for await (const event of stream) {
       if (event.type === "content_block_delta" && event.delta.type === "text_delta") {
-        fullResponse += event.delta.text;
-        res.write(`data: ${JSON.stringify({ content: event.delta.text })}\n\n`);
+        pending += event.delta.text;
+        const { flush, keep, stripped } = sanitizeStreamBuffer(pending);
+        pending = keep;
+        if (stripped) sanitizationFired = true;
+        if (flush) {
+          fullResponse += flush;
+          res.write(`data: ${JSON.stringify({ content: flush })}\n\n`);
+        }
       }
+    }
+
+    // Flush whatever remained held when the stream ended.
+    const finalized = finalizeStreamBuffer(pending);
+    if (finalized.stripped) sanitizationFired = true;
+    if (finalized.text) {
+      fullResponse += finalized.text;
+      res.write(`data: ${JSON.stringify({ content: finalized.text })}\n\n`);
+    }
+
+    if (sanitizationFired) {
+      // Defense-in-depth fired: the Phase 1/Phase 2 prompt split should have made
+      // this impossible, so if we see this in production, investigate.
+      req.log.warn(
+        { conversationId },
+        "Stripped tool-call-imitation text from streamed response (availability prompt-split defense fired)"
+      );
     }
 
     await db.insert(messages).values(
