@@ -85,6 +85,7 @@ export default function ChatPage() {
   const [input, setInput] = useState('');
   const [isTyping, setIsTyping] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
+  const inputRef = useRef<HTMLInputElement>(null);
 
   const createConversation = useCreateAnthropicConversation();
   const { data: bookings } = useListBookings();
@@ -95,6 +96,15 @@ export default function ChatPage() {
       scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
     }
   }, [messages, isTyping]);
+
+  // Re-focus the message input whenever sending finishes. The input is disabled
+  // while isTyping is true, which blurs it; re-enabling does not restore focus,
+  // so without this the guest must click back into the box before every message.
+  useEffect(() => {
+    if (!isTyping) {
+      inputRef.current?.focus();
+    }
+  }, [isTyping]);
 
   const ensureConversation = async (): Promise<number> => {
     if (conversationId) return conversationId;
@@ -544,6 +554,7 @@ export default function ChatPage() {
         <div className="lr__input-wrap">
           <form className="lr__input-form" onSubmit={handleSend}>
             <input
+              ref={inputRef}
               className="lr__input"
               value={input}
               onChange={(e) => setInput(e.target.value)}
