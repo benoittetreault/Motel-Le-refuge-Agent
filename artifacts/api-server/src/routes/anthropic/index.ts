@@ -272,6 +272,21 @@ Respond to the result conversationally and concisely — never in bullet points 
 - too_long: "For a stay that long, the best way is to call us directly at 819-564-9005 — our team will sort out the details with you."
 - check_failed: do NOT mention any error or that a check was attempted. Fall back to the normal behavior exactly — generate the link as usual and note that the booking page shows live availability.`;
 
+// Cheap pre-filter so we only spend a Phase 1 tool-decision round-trip when the
+// latest user message plausibly touches booking, dates, or occupancy. Biased
+// toward false positives — when in doubt we still run Phase 1; we only skip
+// messages that are obviously unrelated (greetings, policy questions, etc.).
+const BOOKING_KEYWORDS = [
+  "book", "reserv", "room", "chambre", "night", "nuit", "stay", "séjour",
+  "date", "guest", "adult", "adulte", "people", "personne", "check-in",
+  "checkin", "available", "availab", "disponib",
+];
+
+function mightInvolveBooking(text: string): boolean {
+  const lower = text.toLowerCase();
+  return BOOKING_KEYWORDS.some((kw) => lower.includes(kw));
+}
+
 router.get("/conversations", async (req, res) => {
   try {
     const all = await db.select().from(conversations).orderBy(conversations.createdAt);
@@ -398,67 +413,73 @@ router.post("/conversations/:id/messages", async (req, res) => {
     type StreamMessages = Parameters<typeof anthropic.messages.stream>[0]["messages"];
     let messagesForStream: StreamMessages = chatMessages;
 
-    try {
-      const toolDecision = await anthropic.messages.create({
-        model: "claude-sonnet-4-6",
-        max_tokens: 8192,
-        system: buildSystemPrompt(),
-        messages: chatMessages,
-        tools: [
-          {
-            name: "check_availability",
-            description:
-              "Check room availability for specific dates before generating a booking link. Call this whenever the guest has given an exact arrival date, number of nights, and number of adults.",
-            input_schema: {
-              type: "object",
-              properties: {
-                arrivalDate: { type: "string", description: "YYYY-MM-DD" },
-                nights: { type: "integer" },
-                adults: { type: "integer" },
-              },
-              required: ["arrivalDate", "nights", "adults"],
-            },
-          },
-        ],
-      });
-
-      if (toolDecision.stop_reason === "tool_use") {
-        const toolUse = toolDecision.content.find((block) => block.type === "tool_use");
-        if (toolUse && toolUse.type === "tool_use") {
-          const { arrivalDate, nights, adults } = toolUse.input as {
-            arrivalDate: string;
-            nights: number;
-            adults: number;
-          };
-          const result = await checkAvailability(arrivalDate, nights, adults);
-
-          messagesForStream = [
-            ...chatMessages,
-            // The SDK types response content (ContentBlock[]) differently from
-            // request content (ContentBlockParam[]), so cast when echoing it back.
+    // Skip the Phase 1 round-trip entirely for messages that obviously have
+    // nothing to do with booking/dates/occupancy (greetings, policy questions,
+    // thanks, etc.). messagesForStream already defaults to chatMessages, so the
+    // skip path goes straight to Phase 2 unchanged.
+    if (mightInvolveBooking(userContent)) {
+      try {
+        const toolDecision = await anthropic.messages.create({
+          model: "claude-sonnet-4-6",
+          max_tokens: 8192,
+          system: buildSystemPrompt(),
+          messages: chatMessages,
+          tools: [
             {
-              role: "assistant",
-              content: toolDecision.content as unknown as StreamMessages[number]["content"],
-            },
-            {
-              role: "user",
-              content: [
-                {
-                  type: "tool_result",
-                  tool_use_id: toolUse.id,
-                  content: JSON.stringify(result),
+              name: "check_availability",
+              description:
+                "Check room availability for specific dates before generating a booking link. Call this whenever the guest has given an exact arrival date, number of nights, and number of adults.",
+              input_schema: {
+                type: "object",
+                properties: {
+                  arrivalDate: { type: "string", description: "YYYY-MM-DD" },
+                  nights: { type: "integer" },
+                  adults: { type: "integer" },
                 },
-              ],
+                required: ["arrivalDate", "nights", "adults"],
+              },
             },
-          ];
+          ],
+        });
+
+        if (toolDecision.stop_reason === "tool_use") {
+          const toolUse = toolDecision.content.find((block) => block.type === "tool_use");
+          if (toolUse && toolUse.type === "tool_use") {
+            const { arrivalDate, nights, adults } = toolUse.input as {
+              arrivalDate: string;
+              nights: number;
+              adults: number;
+            };
+            const result = await checkAvailability(arrivalDate, nights, adults);
+
+            messagesForStream = [
+              ...chatMessages,
+              // The SDK types response content (ContentBlock[]) differently from
+              // request content (ContentBlockParam[]), so cast when echoing it back.
+              {
+                role: "assistant",
+                content: toolDecision.content as unknown as StreamMessages[number]["content"],
+              },
+              {
+                role: "user",
+                content: [
+                  {
+                    type: "tool_result",
+                    tool_use_id: toolUse.id,
+                    content: JSON.stringify(result),
+                  },
+                ],
+              },
+            ];
+          }
         }
+      } catch (err) {
+        // Second safety net around the tool-calling mechanics themselves (in
+        // addition to checkAvailability's own check_failed handling): never let a
+        // Phase 1 failure break or delay the chat beyond a normal reply.
+        req.log.error({ err }, "Availability tool phase failed; continuing without it");
+        messagesForStream = chatMessages;
       }
-    } catch (err) {
-      // Second safety net around the tool-calling mechanics themselves (in
-      // addition to checkAvailability's own check_failed handling): never let a
-      // Phase 1 failure break or delay the chat beyond a normal reply.
-      req.log.error({ err }, "Availability tool phase failed; continuing without it");
-      messagesForStream = chatMessages;
     }
 
     res.setHeader("Content-Type", "text/event-stream");
