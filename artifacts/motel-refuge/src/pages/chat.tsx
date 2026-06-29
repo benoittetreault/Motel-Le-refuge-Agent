@@ -148,43 +148,20 @@ export default function ChatPage() {
 
       if (!res.ok) throw new Error('Failed to send message');
 
-      const reader = res.body!.getReader();
-      const decoder = new TextDecoder();
-      let buffer = '';
-      let assistantContent = '';
-      const assistantMsgId = Date.now() + 1;
+      // The server now verifies any booking link before responding, so it returns
+      // the complete reply as JSON in one shot (no SSE streaming for now).
+      const data: { content?: string } = await res.json();
+      const assistantContent = data.content ?? '';
 
       setMessages((prev) => [
         ...prev,
-        { id: assistantMsgId, role: 'assistant', content: '', timestamp: new Date() },
+        {
+          id: Date.now() + 1,
+          role: 'assistant',
+          content: assistantContent,
+          timestamp: new Date(),
+        },
       ]);
-
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split('\n');
-        buffer = lines.pop() ?? '';
-
-        for (const line of lines) {
-          if (line.startsWith('data: ')) {
-            try {
-              const chunk = JSON.parse(line.slice(6));
-              if (chunk.done) break;
-              if (chunk.content) {
-                assistantContent += chunk.content;
-                setMessages((prev) =>
-                  prev.map((m) =>
-                    m.id === assistantMsgId ? { ...m, content: assistantContent } : m
-                  )
-                );
-              }
-            } catch {
-              // ignore parse errors
-            }
-          }
-        }
-      }
     } catch {
       setMessages((prev) => [
         ...prev,
