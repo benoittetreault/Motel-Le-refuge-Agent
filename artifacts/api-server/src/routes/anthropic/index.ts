@@ -28,24 +28,23 @@ function getCurrentDateContext(): string {
   }).format(now);
 }
 
-// Phase 1 (the non-streaming create() call) is the ONLY place the model actually
-// has the check_availability tool, so the "call the tool first" directive must
-// live only there. Including it in Phase 2 (the streaming call, which has no
-// tools array) is what made the model improvise fake <tool_call> text that
-// leaked to the guest. Keep this directive out of SYSTEM_PROMPT_BODY.
-const AVAILABILITY_TOOL_INSTRUCTION = `## Availability Tool — REQUIRED before any booking link
+// The model is still encouraged to call check_availability to decide what to say,
+// but it is no longer the only line of defense: after the model produces its
+// reply, the server independently re-verifies any booking link it generated (see
+// the POST handler). With a single model call now, this directive can live in the
+// one full prompt rather than being split across phases.
+const AVAILABILITY_TOOL_INSTRUCTION = `## Availability Tool — use before any booking link
 When you have an exact arrival date, number of nights, and number of adults, and you are about to offer or generate a booking link, call the check_availability tool FIRST. Never claim or imply that specific dates are available without having called this tool — do not guess from memory and do not assume. (See "Responding to an availability check" for how to phrase each possible result.)`;
 
-function buildSystemPrompt(options?: { includeAvailabilityToolInstruction?: boolean }): string {
-  const toolInstruction = options?.includeAvailabilityToolInstruction
-    ? `\n\n${AVAILABILITY_TOOL_INSTRUCTION}`
-    : "";
+function buildSystemPrompt(): string {
   return `## CURRENT DATE & TIME (server-injected, Eastern Time — Sherbrooke, Quebec)
 Right now it is: ${getCurrentDateContext()}.
 This is the ONLY source of truth for "today's date" or "what year is it." You have no other way of knowing the current date — never guess, estimate, or rely on your own sense of time.
 If a guest states or implies a different "today" (e.g. "today is the 11th" when it is not), do NOT accept it as fact. Politely correct them using the date above before continuing — never use a guest-asserted date as authoritative for availability or booking calculations without checking it against the date above first.
 
-${SYSTEM_PROMPT_BODY}${toolInstruction}`;
+${SYSTEM_PROMPT_BODY}
+
+${AVAILABILITY_TOOL_INSTRUCTION}`;
 }
 
 const SYSTEM_PROMPT_BODY = `You are the intelligent AI receptionist for Motel Le Refuge in Lennoxville, Quebec.
@@ -300,87 +299,153 @@ function mightInvolveBooking(text: string): boolean {
   return BOOKING_KEYWORDS.some((kw) => lower.includes(kw));
 }
 
-// ---- Defense-in-depth: strip tool-call-imitation text from the stream ----
-// The real fix for the leak is the Phase 1/Phase 2 prompt split above; this is a
-// belt-and-suspenders layer in case the model ever invents some other pseudo
-// tool-call syntax. It removes <tool_call>…</tool_call> and
-// <tool_response>…</tool_response> blocks (case-insensitive) from the streamed
-// text. If it ever fires in production, that's a signal the prompt split didn't
-// fully hold — so callers log a warning when stripping occurs.
-const TOOL_TAGS = ["<tool_call>", "</tool_call>", "<tool_response>", "</tool_response>"];
-const TOOL_OPENING_TAGS = ["<tool_call>", "<tool_response>"];
-const LONGEST_TOOL_TAG = Math.max(...TOOL_TAGS.map((t) => t.length));
-const COMPLETE_TOOL_BLOCK_RE =
-  /<tool_call>[\s\S]*?<\/tool_call>|<tool_response>[\s\S]*?<\/tool_response>/gi;
-const DANGLING_CLOSE_TAG_RE = /<\/tool_(?:call|response)>/gi;
+// ---- Model call + server-side booking-link verification ----
+// One model call produces the reply; the server then independently re-checks any
+// booking link in that reply before it can reach the guest. This is the real
+// safety net: it does not matter whether or how the link was produced — if it
+// points at dates that aren't actually available, we never send it.
+const MODEL = "claude-sonnet-4-6";
+const MAX_TOKENS = 8192;
+// Bound the tool conversation so a misbehaving model can't loop forever.
+const MAX_TOOL_ROUNDS = 4;
 
-// True if `s` is a non-empty prefix of any tool tag (so it could be the start of
-// a tag that is still arriving across future deltas).
-function isPartialToolTag(s: string): boolean {
-  if (!s) return false;
-  const lower = s.toLowerCase();
-  return TOOL_TAGS.some((tag) => tag.startsWith(lower));
+// Reuse the SDK's message-array type without importing the SDK directly.
+type ChatMessageList = Parameters<typeof anthropic.messages.stream>[0]["messages"];
+
+const CHECK_AVAILABILITY_TOOL = {
+  name: "check_availability",
+  description:
+    "Check room availability for specific dates before generating a booking link. Call this whenever the guest has given an exact arrival date, number of nights, and number of adults.",
+  input_schema: {
+    type: "object" as const,
+    properties: {
+      arrivalDate: { type: "string", description: "YYYY-MM-DD" },
+      nights: { type: "integer" },
+      adults: { type: "integer" },
+    },
+    required: ["arrivalDate", "nights", "adults"],
+  },
+};
+
+// Matches a Reservit booking link anywhere in the model's reply (scheme optional).
+const RESERVIT_LINK_RE = /softbooker\.reservit\.com\/reservit\/reserhotel\.php\?[^\s)]+/i;
+const RESERVIT_LINK_RE_G = new RegExp(RESERVIT_LINK_RE.source, "gi");
+
+function findReservitLink(text: string): string | null {
+  const match = text.match(RESERVIT_LINK_RE);
+  return match ? match[0] : null;
 }
 
-// Given the buffered (not-yet-emitted) stream text, return the prefix that is
-// safe to send now (`flush`), the suffix to hold for later (`keep`, because it
-// is — or might become — a tool tag), and whether a complete block was removed.
-function sanitizeStreamBuffer(buffer: string): { flush: string; keep: string; stripped: boolean } {
-  let stripped = false;
-  const cleaned = buffer.replace(COMPLETE_TOOL_BLOCK_RE, () => {
-    stripped = true;
-    return "";
+// Pull fday/fmonth/fyear/nbnights/nbadt out of a Reservit link and normalize them
+// into checkAvailability's arguments. Returns null if anything is missing/invalid.
+function parseReservitParams(
+  link: string
+): { arrivalDate: string; nights: number; adults: number } | null {
+  const q = link.indexOf("?");
+  if (q === -1) return null;
+  const params = new URLSearchParams(link.slice(q + 1));
+  const day = Number.parseInt(params.get("fday") ?? "", 10);
+  const month = Number.parseInt(params.get("fmonth") ?? "", 10);
+  const year = Number.parseInt(params.get("fyear") ?? "", 10);
+  const nights = Number.parseInt(params.get("nbnights") ?? "", 10);
+  const adults = Number.parseInt(params.get("nbadt") ?? "", 10);
+  if ([day, month, year, nights, adults].some((n) => !Number.isFinite(n) || n <= 0)) {
+    return null;
+  }
+  const arrivalDate = `${year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
+  return { arrivalDate, nights, adults };
+}
+
+// Minimal guard kept from the old streaming sanitizer: on the COMPLETE (non-
+// streamed) text we can simply remove any tool-call-imitation blocks in one pass.
+function stripToolTags(text: string): { text: string; stripped: boolean } {
+  if (!text.includes("<tool_call") && !text.includes("<tool_response")) {
+    return { text, stripped: false };
+  }
+  const cleaned = text
+    .replace(/<tool_call>[\s\S]*?<\/tool_call>/gi, "")
+    .replace(/<tool_response>[\s\S]*?<\/tool_response>/gi, "")
+    // Drop any dangling unclosed tag (and everything after it).
+    .replace(/<tool_(?:call|response)\b[\s\S]*$/i, "");
+  return { text: cleaned, stripped: cleaned !== text };
+}
+
+// Concatenate the text blocks of a model response into a plain string.
+function extractAssistantText(content: Array<{ type: string; text?: string }>): string {
+  return content
+    .filter((b) => b.type === "text" && typeof b.text === "string")
+    .map((b) => b.text as string)
+    .join("");
+}
+
+// Run the model to completion (resolving any check_availability tool calls) and
+// return its final text. `includeTool` gates whether the tool is offered at all
+// (a cost optimization; the server-side link check is the real safety net).
+async function generateReply(messages: ChatMessageList, includeTool: boolean): Promise<string> {
+  const working: ChatMessageList = [...messages];
+  const tools = includeTool ? [CHECK_AVAILABILITY_TOOL] : undefined;
+
+  let response = await anthropic.messages.create({
+    model: MODEL,
+    max_tokens: MAX_TOKENS,
+    system: buildSystemPrompt(),
+    messages: working,
+    tools,
   });
 
-  let holdFrom = cleaned.length;
+  let rounds = 0;
+  while (response.stop_reason === "tool_use" && rounds < MAX_TOOL_ROUNDS) {
+    rounds++;
+    const toolUse = response.content.find((b) => b.type === "tool_use");
 
-  // Hold from the earliest still-unclosed opening tag (its close may arrive later).
-  const lower = cleaned.toLowerCase();
-  for (const tag of TOOL_OPENING_TAGS) {
-    const idx = lower.indexOf(tag);
-    if (idx !== -1 && idx < holdFrom) holdFrom = idx;
-  }
+    working.push({
+      role: "assistant",
+      // Response content (ContentBlock[]) is typed differently from request
+      // content (ContentBlockParam[]); cast when echoing it back.
+      content: response.content as unknown as ChatMessageList[number]["content"],
+    });
 
-  // Hold from the earliest tail position that is a partial tool tag (a tag split
-  // across deltas). Such a position can only be within the last (LONGEST-1) chars.
-  const scanStart = Math.max(0, cleaned.length - LONGEST_TOOL_TAG);
-  for (let p = scanStart; p < holdFrom; p++) {
-    if (isPartialToolTag(cleaned.slice(p))) {
-      holdFrom = p;
-      break;
+    let toolResult = JSON.stringify({ status: "check_failed" });
+    if (toolUse && toolUse.type === "tool_use" && toolUse.name === "check_availability") {
+      const { arrivalDate, nights, adults } = toolUse.input as {
+        arrivalDate: string;
+        nights: number;
+        adults: number;
+      };
+      toolResult = JSON.stringify(await checkAvailability(arrivalDate, nights, adults));
     }
+
+    working.push({
+      role: "user",
+      content: [
+        {
+          type: "tool_result",
+          tool_use_id: toolUse && toolUse.type === "tool_use" ? toolUse.id : "unknown",
+          content: toolResult,
+        },
+      ],
+    });
+
+    response = await anthropic.messages.create({
+      model: MODEL,
+      max_tokens: MAX_TOKENS,
+      system: buildSystemPrompt(),
+      messages: working,
+      tools,
+    });
   }
 
-  return { flush: cleaned.slice(0, holdFrom), keep: cleaned.slice(holdFrom), stripped };
-}
-
-// Final pass on whatever text was still held when the stream ended: remove any
-// complete blocks, drop a dangling unclosed opening tag (a hallucination cut off
-// mid-stream) and any stray close tag.
-function finalizeStreamBuffer(buffer: string): { text: string; stripped: boolean } {
-  let stripped = false;
-  let text = buffer.replace(COMPLETE_TOOL_BLOCK_RE, () => {
-    stripped = true;
-    return "";
-  });
-
-  const lower = text.toLowerCase();
-  let cut = -1;
-  for (const tag of TOOL_OPENING_TAGS) {
-    const idx = lower.indexOf(tag);
-    if (idx !== -1 && (cut === -1 || idx < cut)) cut = idx;
-  }
-  if (cut !== -1) {
-    text = text.slice(0, cut);
-    stripped = true;
+  // If we hit the round cap still mid-tool-use, force one final text-only reply.
+  if (response.stop_reason === "tool_use") {
+    response = await anthropic.messages.create({
+      model: MODEL,
+      max_tokens: MAX_TOKENS,
+      system: buildSystemPrompt(),
+      messages: working,
+    });
   }
 
-  text = text.replace(DANGLING_CLOSE_TAG_RE, () => {
-    stripped = true;
-    return "";
-  });
-
-  return { text, stripped };
+  return extractAssistantText(response.content);
 }
 
 router.get("/conversations", async (req, res) => {
@@ -499,150 +564,85 @@ router.post("/conversations/:id/messages", async (req, res) => {
       content: m.content,
     }));
 
-    // ---- PHASE 1: non-streaming tool-decision pass ----
-    // Give the model one chance to call check_availability before we stream the
-    // guest-facing reply. This whole block is best-effort: if anything throws
-    // (the Anthropic call fails, a malformed tool_use block, etc.) we fall through
-    // to Phase 2 with the original, unmodified messages so the chat is never
-    // broken. Nothing here is written to the SSE stream — from the guest's point
-    // of view it's just a slightly longer pause before the reply starts.
-    type StreamMessages = Parameters<typeof anthropic.messages.stream>[0]["messages"];
-    let messagesForStream: StreamMessages = chatMessages;
+    // Build the assistant's candidate reply with a single non-streaming model
+    // call. mightInvolveBooking only gates whether the tool is offered (a cost
+    // optimization) — the server-side link check below is the real safety net,
+    // regardless of whether the model called the tool.
+    const includeTool = mightInvolveBooking(userContent);
+    const candidate = await generateReply(chatMessages, includeTool);
 
-    // Skip the Phase 1 round-trip entirely for messages that obviously have
-    // nothing to do with booking/dates/occupancy (greetings, policy questions,
-    // thanks, etc.). messagesForStream already defaults to chatMessages, so the
-    // skip path goes straight to Phase 2 unchanged.
-    if (mightInvolveBooking(userContent)) {
-      try {
-        const toolDecision = await anthropic.messages.create({
-          model: "claude-sonnet-4-6",
-          max_tokens: 8192,
-          // Phase 1 is the only call with the tools array, so it's the only one
-          // that should carry the "call check_availability first" directive.
-          system: buildSystemPrompt({ includeAvailabilityToolInstruction: true }),
-          messages: chatMessages,
-          tools: [
+    // ---- Server-side booking-link verification ----
+    // If the reply contains a booking link, independently re-verify it before it
+    // can reach the guest — no matter how the model produced it.
+    let finalText = candidate;
+    const link = findReservitLink(candidate);
+
+    if (link) {
+      const parsed = parseReservitParams(link);
+      if (!parsed) {
+        // Link present but unparseable — we can't verify it, so don't block the
+        // guest (treated like check_failed).
+        req.log.warn({ conversationId, link }, "Booking link found but params unparseable; sending unverified");
+      } else {
+        const result = await checkAvailability(parsed.arrivalDate, parsed.nights, parsed.adults);
+
+        if (result.status === "all_available" || result.status === "check_failed") {
+          // Verified available, or we genuinely couldn't check (Reservit down) —
+          // trust the reply as-is. check_failed must never block the guest.
+          finalText = candidate;
+        } else {
+          // partial / none_available / too_long: the link is NOT valid. Reject the
+          // reply and regenerate an honest one, telling the model the exact result
+          // and forbidding any booking link.
+          req.log.warn(
             {
-              name: "check_availability",
-              description:
-                "Check room availability for specific dates before generating a booking link. Call this whenever the guest has given an exact arrival date, number of nights, and number of adults.",
-              input_schema: {
-                type: "object",
-                properties: {
-                  arrivalDate: { type: "string", description: "YYYY-MM-DD" },
-                  nights: { type: "integer" },
-                  adults: { type: "integer" },
-                },
-                required: ["arrivalDate", "nights", "adults"],
-              },
+              conversationId,
+              link,
+              status: result.status,
+              arrivalDate: parsed.arrivalDate,
+              nights: parsed.nights,
+              adults: parsed.adults,
             },
-          ],
-        });
+            "Generated booking link failed server-side availability check; regenerating reply"
+          );
 
-        if (toolDecision.stop_reason === "tool_use") {
-          const toolUse = toolDecision.content.find((block) => block.type === "tool_use");
-          if (toolUse && toolUse.type === "tool_use") {
-            const { arrivalDate, nights, adults } = toolUse.input as {
-              arrivalDate: string;
-              nights: number;
-              adults: number;
-            };
-            const result = await checkAvailability(arrivalDate, nights, adults);
+          const correction = `[SYSTÈME — vérification de disponibilité côté serveur]
+Le lien de réservation que tu étais sur le point d'envoyer (arrivée ${parsed.arrivalDate}, ${parsed.nights} nuit(s), ${parsed.adults} adulte(s)) n'est PAS réservable. Résultat exact de la vérification serveur : ${JSON.stringify(result)}.
+N'inclus AUCUN lien de réservation dans ta réponse. Réponds au client de façon naturelle et concise, dans sa langue, en suivant la section « Responding to an availability check » du prompt pour le statut « ${result.status} » (et « Multiple Rooms » si plusieurs chambres sont en jeu). Au besoin, invite-le à appeler le 819-564-9005.`;
 
-            messagesForStream = [
-              ...chatMessages,
-              // The SDK types response content (ContentBlock[]) differently from
-              // request content (ContentBlockParam[]), so cast when echoing it back.
-              {
-                role: "assistant",
-                content: toolDecision.content as unknown as StreamMessages[number]["content"],
-              },
-              {
-                role: "user",
-                content: [
-                  {
-                    type: "tool_result",
-                    tool_use_id: toolUse.id,
-                    content: JSON.stringify(result),
-                  },
-                ],
-              },
-            ];
+          const regenMessages: ChatMessageList = [
+            ...chatMessages,
+            { role: "assistant", content: candidate },
+            { role: "user", content: correction },
+          ];
+          const regenerated = await generateReply(regenMessages, false);
+
+          // Belt-and-suspenders: on the rejection path, never let any booking link
+          // survive (a regenerated link would itself be unverified).
+          finalText = regenerated.replace(RESERVIT_LINK_RE_G, "").replace(/[ \t]{2,}/g, " ").trim();
+          if (!finalText) {
+            finalText =
+              "Malheureusement, ces dates ne sont pas disponibles. Vous pouvez nous appeler au 819-564-9005 et nous trouverons la meilleure option. / Unfortunately those dates aren't available — please call us at 819-564-9005 and we'll find the best option.";
           }
         }
-      } catch (err) {
-        // Second safety net around the tool-calling mechanics themselves (in
-        // addition to checkAvailability's own check_failed handling): never let a
-        // Phase 1 failure break or delay the chat beyond a normal reply.
-        req.log.error({ err }, "Availability tool phase failed; continuing without it");
-        messagesForStream = chatMessages;
       }
     }
 
-    res.setHeader("Content-Type", "text/event-stream");
-    res.setHeader("Cache-Control", "no-cache");
-    res.setHeader("Connection", "keep-alive");
-
-    let fullResponse = "";
-
-    const stream = anthropic.messages.stream({
-      model: "claude-sonnet-4-6",
-      max_tokens: 8192,
-      system: buildSystemPrompt(),
-      messages: messagesForStream,
-    });
-
-    // `pending` holds buffered text that might be (the start of) a tool-call tag
-    // and so is not yet safe to emit. In normal output it stays tiny — at most a
-    // few trailing chars that look like the start of "<tool_call>".
-    let pending = "";
-    let sanitizationFired = false;
-
-    for await (const event of stream) {
-      if (event.type === "content_block_delta" && event.delta.type === "text_delta") {
-        pending += event.delta.text;
-        const { flush, keep, stripped } = sanitizeStreamBuffer(pending);
-        pending = keep;
-        if (stripped) sanitizationFired = true;
-        if (flush) {
-          fullResponse += flush;
-          res.write(`data: ${JSON.stringify({ content: flush })}\n\n`);
-        }
-      }
+    // Minimal guard on the complete text before sending (defense-in-depth).
+    const guarded = stripToolTags(finalText);
+    if (guarded.stripped) {
+      req.log.warn({ conversationId }, "Stripped tool-call-imitation text from final reply");
     }
-
-    // Flush whatever remained held when the stream ended.
-    const finalized = finalizeStreamBuffer(pending);
-    if (finalized.stripped) sanitizationFired = true;
-    if (finalized.text) {
-      fullResponse += finalized.text;
-      res.write(`data: ${JSON.stringify({ content: finalized.text })}\n\n`);
-    }
-
-    if (sanitizationFired) {
-      // Defense-in-depth fired: the Phase 1/Phase 2 prompt split should have made
-      // this impossible, so if we see this in production, investigate.
-      req.log.warn(
-        { conversationId },
-        "Stripped tool-call-imitation text from streamed response (availability prompt-split defense fired)"
-      );
-    }
+    finalText = guarded.text;
 
     await db.insert(messages).values(
-      insertMessageSchema.parse({ conversationId, role: "assistant", content: fullResponse })
+      insertMessageSchema.parse({ conversationId, role: "assistant", content: finalText })
     );
 
-    res.write(`data: ${JSON.stringify({ done: true })}\n\n`);
-    res.end();
+    res.json({ content: finalText });
   } catch (err) {
     req.log.error({ err }, "Failed to send message");
-    if (!res.headersSent) {
-      res.status(500).json({ error: "Failed to send message" });
-    } else {
-      res.write(`data: ${JSON.stringify({ error: "Stream error" })}\n\n`);
-      res.end();
-    }
+    res.status(500).json({ error: "Failed to send message" });
   }
 });
 
