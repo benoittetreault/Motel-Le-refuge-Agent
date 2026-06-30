@@ -238,7 +238,7 @@ POST-BOOKING: Full message with address, times, phone, hours
 
 ## DO's
 ✅ Ask clarifying questions (one at a time)
-✅ For groups: help them decide how to split, then for 2+ separate rooms direct them to 819-564-9005 to confirm and book together (see Multiple Rooms) — don't hand out multiple "available" links
+✅ For groups: help them decide how to split. For DIFFERENT room types you may offer one link per type; for several rooms of the SAME type, direct them to 819-564-9005 (see Multiple Rooms)
 ✅ For pets: state $100 deposit + all rules clearly
 ✅ For late arrivals: explain phone call required, key will be provided
 ✅ For post-booking: always send address + check-in/out + phone + hours
@@ -282,7 +282,13 @@ Once an availability check has been performed for the guest's dates, its result 
 
 ## Multiple Rooms (group bookings needing 2+ rooms)
 
-Our availability check only verifies ONE room for one set of dates — it cannot verify availability across MULTIPLE rooms (e.g. a guest wanting 2 or 3 separate rooms of the same or different types). If a guest needs more than one room and you've confirmed how they want to split up, do NOT claim or imply that you've verified availability for all of those rooms, and do NOT generate multiple booking links presented as confirmed/available. Instead, say something concise like: "For multiple rooms, the best way to lock in availability across all of them is to call us at 819-564-9005 — our team can confirm everything at once and get you booked." This applies even if a single-room check happens to come back available — that result only covers one room, not the full group's need. (Single-room bookings are unaffected: keep handling those exactly as usual.)`;
+Our availability check verifies ONE room for one set of dates. It can tell that at least one room is available, but NOT how many remain — so it can never confirm two or more rooms of the SAME type. Treat these two cases differently:
+
+- DIFFERENT room types (e.g. 1 Queen + 1 Double): you MAY offer one separate booking link per room type, but only once the conversation has clearly confirmed exactly which room type is for whom (the dates, number of nights, and number of adults for each room). Generate one link per room type using the normal booking-link rules. The server re-verifies each link independently before anything is sent — and if even one of the rooms isn't actually available, the whole reply is held back and the guest is redirected to the phone. So never state it's "confirmed"; simply offer the links.
+
+- SAME room type, two or more (e.g. 2 or 3 Double rooms): this CANNOT be verified. Do NOT generate multiple links and do NOT imply availability. Say something concise like: "For several rooms of the same type, the best way to lock in availability is to call us at 819-564-9005 — our team can confirm everything at once and get you booked."
+
+Never claim you've verified availability beyond a single room per type. Single-room bookings are unaffected: keep handling those exactly as usual.`;
 
 // Cheap pre-filter so we only spend a Phase 1 tool-decision round-trip when the
 // latest user message plausibly touches booking, dates, or occupancy. Biased
@@ -331,9 +337,32 @@ const CHECK_AVAILABILITY_TOOL = {
 const RESERVIT_LINK_RE = /softbooker\.reservit\.com\/reservit\/reserhotel\.php\?[^\s)]+/i;
 const RESERVIT_LINK_RE_G = new RegExp(RESERVIT_LINK_RE.source, "gi");
 
-function findReservitLink(text: string): string | null {
-  const match = text.match(RESERVIT_LINK_RE);
-  return match ? match[0] : null;
+// Return every Reservit booking link in the text (one per room a multi-type
+// group booking would offer). Empty array if none.
+function findAllReservitLinks(text: string): string[] {
+  return text.match(RESERVIT_LINK_RE_G) ?? [];
+}
+
+// Regenerate an honest, link-free reply after server-side verification rejected
+// the model's booking link(s). The model is told the exact result(s) via the
+// correction message; we also strip any link it stubbornly re-emits, with a
+// bilingual fallback if nothing usable remains.
+async function regenerateHonestReply(
+  baseMessages: ChatMessageList,
+  candidate: string,
+  correction: string
+): Promise<string> {
+  const regenMessages: ChatMessageList = [
+    ...baseMessages,
+    { role: "assistant", content: candidate },
+    { role: "user", content: correction },
+  ];
+  const regenerated = await generateReply(regenMessages, false);
+  const safe = regenerated.replace(RESERVIT_LINK_RE_G, "").replace(/[ \t]{2,}/g, " ").trim();
+  return (
+    safe ||
+    "Malheureusement, ces dates ne sont pas disponibles. Vous pouvez nous appeler au 819-564-9005 et nous trouverons la meilleure option. / Unfortunately those dates aren't available — please call us at 819-564-9005 and we'll find the best option."
+  );
 }
 
 // Pull fday/fmonth/fyear/nbnights/nbadt out of a Reservit link and normalize them
@@ -575,9 +604,11 @@ router.post("/conversations/:id/messages", async (req, res) => {
     // If the reply contains a booking link, independently re-verify it before it
     // can reach the guest — no matter how the model produced it.
     let finalText = candidate;
-    const link = findReservitLink(candidate);
+    const links = findAllReservitLinks(candidate);
 
-    if (link) {
+    if (links.length === 1) {
+      // ---- Single booking link: unchanged verification behavior ----
+      const link = links[0];
       const parsed = parseReservitParams(link);
       if (!parsed) {
         // Link present but unparseable — we can't verify it, so don't block the
@@ -610,20 +641,66 @@ router.post("/conversations/:id/messages", async (req, res) => {
 Le lien de réservation que tu étais sur le point d'envoyer (arrivée ${parsed.arrivalDate}, ${parsed.nights} nuit(s), ${parsed.adults} adulte(s)) n'est PAS réservable. Résultat exact de la vérification serveur : ${JSON.stringify(result)}.
 N'inclus AUCUN lien de réservation dans ta réponse. Réponds au client de façon naturelle et concise, dans sa langue, en suivant la section « Responding to an availability check » du prompt pour le statut « ${result.status} » (et « Multiple Rooms » si plusieurs chambres sont en jeu). Au besoin, invite-le à appeler le 819-564-9005.`;
 
-          const regenMessages: ChatMessageList = [
-            ...chatMessages,
-            { role: "assistant", content: candidate },
-            { role: "user", content: correction },
-          ];
-          const regenerated = await generateReply(regenMessages, false);
+          finalText = await regenerateHonestReply(chatMessages, candidate, correction);
+        }
+      }
+    } else if (links.length >= 2) {
+      // ---- Multiple booking links: only legitimate for DIFFERENT room types ----
+      // We can't tell how many rooms of one type remain, so the prompt only lets
+      // the model emit several links for DIFFERENT types. We verify each link
+      // independently; the booking is confirmed only if EVERY link is available.
+      const parsedLinks = links.map((link) => ({ link, parsed: parseReservitParams(link) }));
+      const verifiable = parsedLinks.filter(
+        (p): p is { link: string; parsed: { arrivalDate: string; nights: number; adults: number } } =>
+          p.parsed !== null
+      );
 
-          // Belt-and-suspenders: on the rejection path, never let any booking link
-          // survive (a regenerated link would itself be unverified).
-          finalText = regenerated.replace(RESERVIT_LINK_RE_G, "").replace(/[ \t]{2,}/g, " ").trim();
-          if (!finalText) {
-            finalText =
-              "Malheureusement, ces dates ne sont pas disponibles. Vous pouvez nous appeler au 819-564-9005 et nous trouverons la meilleure option. / Unfortunately those dates aren't available — please call us at 819-564-9005 and we'll find the best option.";
-          }
+      if (verifiable.length === 0) {
+        // None parseable — can't verify; don't block the guest.
+        req.log.warn({ conversationId, links }, "Multiple booking links found but none parseable; sending unverified");
+      } else {
+        const results = await Promise.all(
+          verifiable.map((v) => checkAvailability(v.parsed.arrivalDate, v.parsed.nights, v.parsed.adults))
+        );
+        const checks = verifiable.map((v, i) => ({ ...v, result: results[i] }));
+
+        // A "hard failure" is any room that is definitively not bookable. An
+        // individual check_failed is non-blocking (we can't say no), so on its own
+        // it does NOT sink the booking.
+        const hardFailures = checks.filter(
+          (c) => c.result.status !== "all_available" && c.result.status !== "check_failed"
+        );
+
+        if (hardFailures.length === 0) {
+          // Every room is available (or individually unverifiable) — send as-is.
+          finalText = candidate;
+        } else {
+          req.log.warn(
+            {
+              conversationId,
+              rooms: checks.map((c) => ({
+                arrivalDate: c.parsed.arrivalDate,
+                nights: c.parsed.nights,
+                adults: c.parsed.adults,
+                status: c.result.status,
+              })),
+            },
+            "One or more rooms failed multi-room server-side availability check; regenerating reply"
+          );
+
+          const perRoom = checks
+            .map(
+              (c) =>
+                `- Chambre (arrivée ${c.parsed.arrivalDate}, ${c.parsed.nights} nuit(s), ${c.parsed.adults} adulte(s)) : ${JSON.stringify(c.result)}`
+            )
+            .join("\n");
+
+          const correction = `[SYSTÈME — vérification de disponibilité côté serveur — réservation multi-chambres]
+Tu étais sur le point d'envoyer plusieurs liens de réservation, mais au moins une des chambres n'est PAS réservable. Une réservation multi-chambres ne peut être confirmée que si TOUTES les chambres sont disponibles. Résultat exact de la vérification serveur, chambre par chambre :
+${perRoom}
+N'inclus AUCUN lien de réservation dans ta réponse. Réponds au client de façon naturelle et concise, dans sa langue, en suivant la section « Multiple Rooms » du prompt : invite-le à appeler le 819-564-9005 pour que l'équipe confirme et organise l'ensemble.`;
+
+          finalText = await regenerateHonestReply(chatMessages, candidate, correction);
         }
       }
     }
