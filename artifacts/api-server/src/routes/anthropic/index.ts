@@ -313,21 +313,6 @@ Agent (proposed Double+Queen for 5 people) → Guest: 'we'll take a double room'
 Good response: 'Just to confirm — are you keeping both rooms (the Double and the Queen), or would you like just the Double for everyone?'
 Bad response (never do this): generating a link without clarifying.`;
 
-// Cheap pre-filter so we only spend a Phase 1 tool-decision round-trip when the
-// latest user message plausibly touches booking, dates, or occupancy. Biased
-// toward false positives — when in doubt we still run Phase 1; we only skip
-// messages that are obviously unrelated (greetings, policy questions, etc.).
-const BOOKING_KEYWORDS = [
-  "book", "reserv", "room", "chambre", "night", "nuit", "stay", "séjour",
-  "date", "guest", "adult", "adulte", "people", "personne", "check-in",
-  "checkin", "available", "availab", "disponib",
-];
-
-function mightInvolveBooking(text: string): boolean {
-  const lower = text.toLowerCase();
-  return BOOKING_KEYWORDS.some((kw) => lower.includes(kw));
-}
-
 // ---- Model call + server-side booking-link verification ----
 // One model call produces the reply; the server then independently re-checks any
 // booking link in that reply before it can reach the guest. This is the real
@@ -380,6 +365,10 @@ async function regenerateHonestReply(
     { role: "assistant", content: candidate },
     { role: "user", content: correction },
   ];
+  // Withhold the availability tool here (allowTool=false): we are correcting a
+  // link we have already proven invalid, so the model must NOT re-verify and
+  // re-propose a link mid-correction. This is the one place the tool is
+  // intentionally suppressed — everywhere else it is always offered.
   const regenerated = await generateReply(regenMessages, false);
   const safe = regenerated.replace(RESERVIT_LINK_RE_G, "").replace(/[ \t]{2,}/g, " ").trim();
   return (
@@ -417,11 +406,17 @@ function extractAssistantText(content: Array<{ type: string; text?: string }>): 
 }
 
 // Run the model to completion (resolving any check_availability tool calls) and
-// return its final text. `includeTool` gates whether the tool is offered at all
-// (a cost optimization; the server-side link check is the real safety net).
-async function generateReply(messages: ChatMessageList, includeTool: boolean): Promise<string> {
+// return its final text. The tool is ALWAYS offered by default. We used to gate
+// it behind a keyword pre-filter as a cost optimization, but that caused real
+// bugs: it skipped short confirmations ("ok"/"oui") — letting unverified links
+// slip through — and date-only replies ("10 septembre au 13") that carry no
+// keyword, forcing the model to promise a check it couldn't perform that turn and
+// stalling the conversation. `allowTool` exists ONLY so regenerateHonestReply can
+// withhold the tool while correcting an already-rejected link (see there); every
+// normal call leaves it at its default of true.
+async function generateReply(messages: ChatMessageList, allowTool = true): Promise<string> {
   const working: ChatMessageList = [...messages];
-  const tools = includeTool ? [CHECK_AVAILABILITY_TOOL] : undefined;
+  const tools = allowTool ? [CHECK_AVAILABILITY_TOOL] : undefined;
 
   let response = await anthropic.messages.create({
     model: MODEL,
@@ -603,11 +598,9 @@ router.post("/conversations/:id/messages", async (req, res) => {
     }));
 
     // Build the assistant's candidate reply with a single non-streaming model
-    // call. mightInvolveBooking only gates whether the tool is offered (a cost
-    // optimization) — the server-side link check below is the real safety net,
-    // regardless of whether the model called the tool.
-    const includeTool = mightInvolveBooking(userContent);
-    const candidate = await generateReply(chatMessages, includeTool);
+    // call. The check_availability tool is always offered; the server-side link
+    // check below is the real safety net, regardless of whether the model used it.
+    const candidate = await generateReply(chatMessages);
 
     // ---- Server-side booking-link verification ----
     // If the reply contains a booking link, independently re-verify it before it
