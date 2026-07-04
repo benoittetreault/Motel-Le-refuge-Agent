@@ -46,10 +46,7 @@ motel-refuge-glitch/
 
 **Your Neon credentials:**
 ```
-Host: ep-spring-tree-adk3kyya.c-2.us-east-1.aws.neon.tech
-Database: neondb
-User: neondb_owner
-Password: npg_FX8yGdilcWN1
+[REDACTED — credential roté, voir variables d'environnement Railway]
 ```
 
 **Tables created automatically:**
