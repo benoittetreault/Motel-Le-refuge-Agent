@@ -11,6 +11,7 @@ import {
 import { anthropic } from "@workspace/integrations-anthropic-ai";
 import { eq } from "drizzle-orm";
 import { checkAvailability } from "./availability";
+import { stripToolTags } from "./strip-tool-tags";
 
 const router = Router();
 
@@ -407,20 +408,6 @@ function parseReservitParams(
   return { arrivalDate, nights, adults };
 }
 
-// Minimal guard kept from the old streaming sanitizer: on the COMPLETE (non-
-// streamed) text we can simply remove any tool-call-imitation blocks in one pass.
-function stripToolTags(text: string): { text: string; stripped: boolean } {
-  if (!text.includes("<tool_call") && !text.includes("<tool_response")) {
-    return { text, stripped: false };
-  }
-  const cleaned = text
-    .replace(/<tool_call>[\s\S]*?<\/tool_call>/gi, "")
-    .replace(/<tool_response>[\s\S]*?<\/tool_response>/gi, "")
-    // Drop any dangling unclosed tag (and everything after it).
-    .replace(/<tool_(?:call|response)\b[\s\S]*$/i, "");
-  return { text: cleaned, stripped: cleaned !== text };
-}
-
 // Concatenate the text blocks of a model response into a plain string.
 function extractAssistantText(content: Array<{ type: string; text?: string }>): string {
   return content
@@ -728,9 +715,16 @@ N'inclus AUCUN lien de réservation dans ta réponse. Réponds au client de faç
     }
 
     // Minimal guard on the complete text before sending (defense-in-depth).
+    const beforeGuard = finalText;
     const guarded = stripToolTags(finalText);
     if (guarded.stripped) {
-      req.log.warn({ conversationId }, "Stripped tool-call-imitation text from final reply");
+      // Log the exact original text so we can see which new tool-syntax variants
+      // the model is hallucinating over time (the sanitizer is name-agnostic, so
+      // this is our only visibility into emerging shapes).
+      req.log.warn(
+        { conversationId, original: beforeGuard, cleaned: guarded.text },
+        "Stripped tool-call-imitation text from final reply"
+      );
     }
     finalText = guarded.text;
 
