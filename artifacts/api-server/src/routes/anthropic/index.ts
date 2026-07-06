@@ -12,6 +12,7 @@ import { anthropic } from "@workspace/integrations-anthropic-ai";
 import { eq } from "drizzle-orm";
 import { checkAvailability } from "./availability";
 import { stripToolTags } from "./strip-tool-tags";
+import { buildToolResults } from "./tool-results";
 
 const router = Router();
 
@@ -429,7 +430,6 @@ async function generateReply(messages: ChatMessageList, allowTool = true): Promi
   let rounds = 0;
   while (response.stop_reason === "tool_use" && rounds < MAX_TOOL_ROUNDS) {
     rounds++;
-    const toolUse = response.content.find((b) => b.type === "tool_use");
 
     working.push({
       role: "assistant",
@@ -438,25 +438,18 @@ async function generateReply(messages: ChatMessageList, allowTool = true): Promi
       content: response.content as unknown as ChatMessageList[number]["content"],
     });
 
-    let toolResult = JSON.stringify({ status: "check_failed" });
-    if (toolUse && toolUse.type === "tool_use" && toolUse.name === "check_availability") {
-      const { arrivalDate, nights, adults } = toolUse.input as {
-        arrivalDate: string;
-        nights: number;
-        adults: number;
-      };
-      toolResult = JSON.stringify(await checkAvailability(arrivalDate, nights, adults));
-    }
+    // Answer EVERY tool_use block in this turn, not just the first. The model can
+    // call check_availability multiple times in one turn (e.g. once per room type
+    // for a Double + Queen group); the API rejects the next request with a 400 if
+    // any tool_use id lacks a matching tool_result.
+    const toolResults = await buildToolResults(
+      response.content as unknown as Parameters<typeof buildToolResults>[0],
+      checkAvailability
+    );
 
     working.push({
       role: "user",
-      content: [
-        {
-          type: "tool_result",
-          tool_use_id: toolUse && toolUse.type === "tool_use" ? toolUse.id : "unknown",
-          content: toolResult,
-        },
-      ],
+      content: toolResults as unknown as ChatMessageList[number]["content"],
     });
 
     response = await anthropic.messages.create({
