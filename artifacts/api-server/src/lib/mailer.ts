@@ -1,4 +1,7 @@
 import nodemailer from "nodemailer";
+import { getMotelConfig } from "@workspace/motel-config";
+
+const motel = getMotelConfig();
 
 export interface BookingEmailData {
   fullName: string;
@@ -33,11 +36,13 @@ export async function sendBookingEmail(
     return;
   }
 
-  const petNote = booking.hasPet ? "Oui / Yes ($100 dépôt remboursable / refundable deposit)" : "Non";
+  const petNote = booking.hasPet
+    ? `Oui / Yes ($${motel.policies.pets.deposit} dépôt remboursable / refundable deposit)`
+    : "Non";
   const html = `
     <div style="font-family: Georgia, serif; max-width: 600px; margin: 0 auto; padding: 24px; background: #f8f6f1;">
       <h1 style="color: #1a3a4a; border-bottom: 2px solid #c8a97a; padding-bottom: 12px;">
-        ⚓ Nouvelle réservation — Motel Le Refuge
+        ⚓ Nouvelle réservation — ${motel.identity.name}
       </h1>
       <p style="color: #c0392b; font-weight: bold; background: #fef9e7; padding: 12px; border-left: 4px solid #f39c12;">
         ⚠️ Cette réservation doit être saisie manuellement dans Reservit immédiatement.<br/>
@@ -55,12 +60,12 @@ export async function sendBookingEmail(
         <tr><td style="padding: 8px; font-weight: bold; color: #555;">Langue / Language</td><td style="padding: 8px;">${booking.language}</td></tr>
         <tr style="background:#fff;"><td style="padding: 8px; font-weight: bold; color: #555;">Reçu le / Received</td><td style="padding: 8px;">${new Date(booking.createdAt).toLocaleString("fr-CA")}</td></tr>
       </table>
-      <p style="margin-top: 24px; font-size: 12px; color: #999;">Motel Le Refuge — 43 Queen Street, Lennoxville (Sherbrooke), QC J1M 1J2 — 819-564-9005</p>
+      <p style="margin-top: 24px; font-size: 12px; color: #999;">${motel.identity.name} — ${motel.identity.address} — ${motel.identity.phone}</p>
     </div>
   `;
 
   await transporter.sendMail({
-    from: `"Motel Le Refuge AI" <${process.env.GMAIL_USER}>`,
+    from: `"${motel.identity.name} AI" <${process.env.GMAIL_USER}>`,
     to: toEmail,
     subject: `[Réservation] ${booking.fullName} — ${booking.checkIn} → ${booking.checkOut}`,
     html,
