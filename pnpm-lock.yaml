@@ -92,6 +92,9 @@ importers:
       '@workspace/integrations-anthropic-ai':
         specifier: workspace:*
         version: link:../../lib/integrations-anthropic-ai
+      '@workspace/motel-config':
+        specifier: workspace:*
+        version: link:../../lib/motel-config
       cookie-parser:
         specifier: ^1.4.7
         version: 1.4.7
@@ -566,6 +569,8 @@ importers:
       '@types/node':
         specifier: 'catalog:'
         version: 25.6.2
+
+  lib/motel-config: {}
 
   scripts:
     devDependencies:
