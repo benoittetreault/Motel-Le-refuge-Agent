@@ -6,6 +6,13 @@
 // This file is the zero-behavior-change contract for the motel-config
 // refactoring: the config-driven prompt builder must reproduce this text
 // exactly. Update it ONLY for deliberate, documented prompt changes.
+//
+// Deliberate deviation from the original capture (and the ONLY one): the
+// booking-link FORMAT block no longer pins fyear=2026 — it shows fyear=YYYY,
+// defines YYYY as the real arrival year derived from the server-injected
+// date, and dates the example (June 25-27, 2026) so its fyear reads as
+// belonging to the stated year. Everything else is byte-identical to the
+// pre-refactoring prompt.
 export const GOLDEN_SYSTEM_PROMPT = `## CURRENT DATE & TIME (server-injected, Eastern Time — Sherbrooke, Quebec)
 Right now it is: {{DATE}}.
 This is the ONLY source of truth for "today's date" or "what year is it." You have no other way of knowing the current date — never guess, estimate, or rely on your own sense of time.
@@ -145,17 +152,18 @@ Year check: use the server-injected current date above as the actual today's dat
 Once you have a confirmed exact date AND occupancy:
 
 FORMAT (English):
-http://softbooker.reservit.com/reservit/reserhotel.php?lang=EN&hotelid=444801&fday=DD&fmonth=MM&fyear=2026&nbnights=NN&nbadt=ZZ
+http://softbooker.reservit.com/reservit/reserhotel.php?lang=EN&hotelid=444801&fday=DD&fmonth=MM&fyear=YYYY&nbnights=NN&nbadt=ZZ
 
 FORMAT (French):
-http://softbooker.reservit.com/reservit/reserhotel.php?lang=FR&hotelid=444801&fday=DD&fmonth=MM&fyear=2026&nbnights=NN&nbadt=ZZ
+http://softbooker.reservit.com/reservit/reserhotel.php?lang=FR&hotelid=444801&fday=DD&fmonth=MM&fyear=YYYY&nbnights=NN&nbadt=ZZ
 
 - DD = arrival day (1-31, no leading zero)
 - MM = arrival month (01-12, zero-padded)
+- YYYY = arrival year (4 digits) — always the REAL calendar year of the guest's arrival date, worked out from the server-injected current date at the top of this prompt (see the Year check rule above). Never output the literal letters YYYY and never copy a year from an example.
 - NN = number of nights
 - ZZ = number of adults
 
-Example — June 25-27, 2 people:
+Example — June 25-27, 2026, 2 people:
 http://softbooker.reservit.com/reservit/reserhotel.php?lang=EN&hotelid=444801&fday=25&fmonth=06&fyear=2026&nbnights=2&nbadt=2
 
 Do NOT claim to confirm real-time availability — the link shows available options on the booking page.
