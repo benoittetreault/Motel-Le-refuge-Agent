@@ -4,6 +4,11 @@ import { checkAvailability } from "./availability";
 import { buildToolResults } from "./tool-results";
 import { buildSystemPrompt } from "./system-prompt";
 
+// Re-exported for existing call sites (the web route imports these from here).
+// The definitions live in reservit-link.ts so pure consumers (the voice
+// concierge helpers, tests) can use them without importing the model client.
+export { RESERVIT_LINK_RE, RESERVIT_LINK_RE_G, findAllReservitLinks } from "./reservit-link";
+
 // Shared conversation "brain" for every channel (web chat + voice). The model
 // call, the check_availability tool loop, and the Reservit link pattern all
 // live here so both routes drive the exact same logic. Channel-specific
@@ -34,19 +39,6 @@ const CHECK_AVAILABILITY_TOOL = {
     required: ["arrivalDate", "nights", "adults"],
   },
 };
-
-// Matches a Reservit booking link anywhere in the model's reply (scheme optional).
-// Engine-level pattern (mirrors config.booking.linkBase) — shared by every motel
-// on Reservit, so it is not part of the per-motel config. The web route uses it
-// to verify links; the voice route uses it to strip them (a link can't be spoken).
-export const RESERVIT_LINK_RE = /softbooker\.reservit\.com\/reservit\/reserhotel\.php\?[^\s)]+/i;
-export const RESERVIT_LINK_RE_G = new RegExp(RESERVIT_LINK_RE.source, "gi");
-
-// Return every Reservit booking link in the text (one per room a multi-type
-// group booking would offer). Empty array if none.
-export function findAllReservitLinks(text: string): string[] {
-  return text.match(RESERVIT_LINK_RE_G) ?? [];
-}
 
 // Concatenate the text blocks of a model response into a plain string.
 function extractAssistantText(content: Array<{ type: string; text?: string }>): string {
