@@ -7,15 +7,19 @@
  * partially available.
  */
 
-// 58 = Reservit chain ID, 444801 = Motel Le Refuge hotel ID.
-const RESERVIT_BEST_PRICE_URL = "https://secure.reservit.com/api/rs/bestprice/58/444801";
+import { getMotelConfig } from "@workspace/motel-config";
+
+const motel = getMotelConfig();
+
+// e.g. https://secure.reservit.com/api/rs/bestprice/58/444801 (chain / hotel).
+const RESERVIT_BEST_PRICE_URL = `${motel.booking.bestPriceBase}/${motel.booking.chainId}/${motel.booking.hotelId}`;
 
 // Per-night request timeout. Each night is an independent HTTP call.
 const NIGHT_TIMEOUT_MS = 4000;
 
 // Hard cap on how long a single check may be. Beyond this we bail out rather
 // than firing dozens of upstream requests.
-const MAX_NIGHTS = 14;
+const MAX_NIGHTS = motel.booking.maxNights;
 
 export interface NightResult {
   /** Arrival date for this single night, YYYY-MM-DD. */
@@ -56,7 +60,7 @@ async function checkNight(fromdate: string, adults: number): Promise<NightResult
     // One "30" (a 30-year-old adult) per guest, e.g. 2 adults -> "30,30".
     roomAge1: Array.from({ length: adults }, () => "30").join(","),
     lang: "EN",
-    currency: "USD",
+    currency: motel.booking.currency,
     serviceIncluded: "false",
   });
 
