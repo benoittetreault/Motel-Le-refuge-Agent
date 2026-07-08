@@ -47,7 +47,8 @@ interface VapiChatBody {
 const VAPI_SECRET = process.env.VAPI_SECRET;
 const VAPI_SECRET_HEADER = process.env.VAPI_SECRET_HEADER ?? DEFAULT_VAPI_SECRET_HEADER;
 
-router.post("/chat", async (req, res) => {
+// Shared handler for both route aliases (see registration below).
+const handleVoiceChat: import("express").RequestHandler = async (req, res) => {
   try {
     const body = req.body as VapiChatBody;
 
@@ -131,6 +132,12 @@ router.post("/chat", async (req, res) => {
     req.log.error({ err }, "voice: failed to handle turn");
     res.status(500).json({ error: "Failed to handle voice turn" });
   }
-});
+};
+
+// Register the same handler under both conventions Vapi may use for the Custom
+// LLM URL: the exact path given as-is ("/chat"), or an OpenAI-style base URL to
+// which Vapi appends "/chat/completions".
+router.post("/chat", handleVoiceChat);
+router.post("/chat/completions", handleVoiceChat);
 
 export default router;
