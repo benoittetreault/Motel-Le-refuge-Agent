@@ -19,8 +19,11 @@ import {
 // Vapi handles the telephony (ASR + TTS). Configured in "Custom LLM" mode, it
 // POSTs an OpenAI-compatible /chat/completions body to us on every turn, with
 // its call metadata merged in. We run the SAME brain as the web chat
-// (generateReply) and answer with a single non-streaming OpenAI chat.completion
-// object — Vapi accepts non-streaming JSON, so we do NOT reintroduce streaming.
+// (generateReply). Vapi always sends stream:true and only speaks a reply
+// delivered as an OpenAI SSE stream — a plain JSON body leaves it silent — so we
+// answer in SSE. Crucially we do NOT stream the GENERATION: generateReply still
+// runs to completion and the concierge net verifies the FULL text first; we only
+// wrap that finished, already-verified reply as SSE (see the response below).
 //
 // Concierge scope for Block A: the agent answers questions and checks
 // availability (check_availability runs normally, internally), but NEVER speaks
