@@ -114,6 +114,10 @@ const handleVoiceChat: import("express").RequestHandler = async (req, res) => {
       req.log.info({ callId }, "voice: booking link present — replaced with invite-to-call");
     }
 
+    if (process.env.VOICE_DEBUG_LOG === "true") {
+      req.log.info({ callId, reply }, "voice: outgoing spoken reply (VOICE_DEBUG_LOG)");
+    }
+
     // ---- Respond in OpenAI chat.completion shape (non-streaming) ----
     res.json({
       id: `chatcmpl-${callId ?? randomUUID()}`,
