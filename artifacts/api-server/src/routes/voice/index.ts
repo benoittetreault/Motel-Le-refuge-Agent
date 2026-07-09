@@ -8,6 +8,7 @@ import {
   secretMatches,
   extractProvidedSecret,
   toSpokenReply,
+  formatSsePayload,
   DEFAULT_VAPI_SECRET_HEADER,
   type VapiMessage,
 } from "./concierge";
@@ -18,8 +19,11 @@ import {
 // Vapi handles the telephony (ASR + TTS). Configured in "Custom LLM" mode, it
 // POSTs an OpenAI-compatible /chat/completions body to us on every turn, with
 // its call metadata merged in. We run the SAME brain as the web chat
-// (generateReply) and answer with a single non-streaming OpenAI chat.completion
-// object — Vapi accepts non-streaming JSON, so we do NOT reintroduce streaming.
+// (generateReply). Vapi always sends stream:true and only speaks a reply
+// delivered as an OpenAI SSE stream — a plain JSON body leaves it silent — so we
+// answer in SSE. Crucially we do NOT stream the GENERATION: generateReply still
+// runs to completion and the concierge net verifies the FULL text first; we only
+// wrap that finished, already-verified reply as SSE (see the response below).
 //
 // Concierge scope for Block A: the agent answers questions and checks
 // availability (check_availability runs normally, internally), but NEVER speaks
@@ -118,20 +122,23 @@ const handleVoiceChat: import("express").RequestHandler = async (req, res) => {
       req.log.info({ callId, reply }, "voice: outgoing spoken reply (VOICE_DEBUG_LOG)");
     }
 
-    // ---- Respond in OpenAI chat.completion shape (non-streaming) ----
-    res.json({
-      id: `chatcmpl-${callId ?? randomUUID()}`,
-      object: "chat.completion",
-      created: Math.floor(Date.now() / 1000),
-      model: body.model ?? "custom-llm",
-      choices: [
-        {
-          index: 0,
-          message: { role: "assistant", content: reply },
-          finish_reason: "stop",
-        },
-      ],
-    });
+    // ---- Respond as OpenAI SSE (chat.completion.chunk) ----
+    // Vapi only speaks a reply delivered as a streaming SSE response; a plain
+    // JSON body leaves it silent. The reply is already complete and verified —
+    // we simply wrap it as SSE (single content chunk), so no logic or safety
+    // changes upstream. Error paths above already returned JSON before we get
+    // here, so no SSE headers were set on those.
+    res.setHeader("Content-Type", "text/event-stream");
+    res.setHeader("Cache-Control", "no-cache");
+    res.setHeader("Connection", "keep-alive");
+    res.write(
+      formatSsePayload(reply, {
+        id: `chatcmpl-${callId ?? randomUUID()}`,
+        model: body.model ?? "custom-llm",
+        created: Math.floor(Date.now() / 1000),
+      })
+    );
+    res.end();
   } catch (err) {
     req.log.error({ err }, "voice: failed to handle turn");
     res.status(500).json({ error: "Failed to handle voice turn" });
