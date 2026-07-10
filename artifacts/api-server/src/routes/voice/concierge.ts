@@ -76,3 +76,51 @@ export function toSpokenReply(
   reply = reply.replace(RESERVIT_LINK_RE_G, "").replace(/[ \t]{2,}/g, " ").trim();
   return stripToolTags(reply).text;
 }
+
+// ---- SSE response formatting (Vapi Custom LLM) --------------------------------
+// Vapi's Custom LLM endpoint only speaks a reply that arrives as an OpenAI
+// streaming response (Server-Sent Events of chat.completion.chunk) — a plain
+// non-streaming JSON body leaves the assistant silent, even though Vapi always
+// sends stream:true. We do NOT stream the model: generateReply + toSpokenReply
+// still produce the complete, concierge-verified text first, and only THEN do we
+// wrap that finished text as SSE. Nothing can leak mid-generation because we
+// don't emit a byte until the safe reply is fully in hand.
+//
+// These helpers are pure (no HTTP) so the exact chunk shape is unit-tested; the
+// route just sets headers and writes the payload string.
+
+export interface SseChunkMeta {
+  /** Same id echoed on every chunk of one response. */
+  id: string;
+  /** Model label echoed back (from the request, or a default). */
+  model: string;
+  /** Unix seconds; identical on every chunk of one response. */
+  created: number;
+}
+
+// The chunk sequence mirrors a real OpenAI stream so Vapi's accumulator handles
+// it exactly like a native provider: role announced first, then the full text
+// in one content delta, then an empty delta carrying finish_reason:"stop". We
+// emit the whole reply in a single content chunk (no word-by-word split) since
+// the text is already complete.
+export function buildSseChunks(reply: string, meta: SseChunkMeta): Array<Record<string, unknown>> {
+  const base = {
+    id: meta.id,
+    object: "chat.completion.chunk",
+    created: meta.created,
+    model: meta.model,
+  };
+  return [
+    { ...base, choices: [{ index: 0, delta: { role: "assistant", content: "" }, finish_reason: null }] },
+    { ...base, choices: [{ index: 0, delta: { content: reply }, finish_reason: null }] },
+    { ...base, choices: [{ index: 0, delta: {}, finish_reason: "stop" }] },
+  ];
+}
+
+// Serialize the chunks as an SSE payload: one `data: <json>\n\n` line per chunk,
+// terminated by the literal `data: [DONE]\n\n` sentinel Vapi expects.
+export function formatSsePayload(reply: string, meta: SseChunkMeta): string {
+  const lines = buildSseChunks(reply, meta).map((c) => `data: ${JSON.stringify(c)}\n\n`);
+  lines.push("data: [DONE]\n\n");
+  return lines.join("");
+}
