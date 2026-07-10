@@ -58,6 +58,53 @@ export function mapVapiMessages(messages: VapiMessage[]): ChatMessageList {
   return mapped;
 }
 
+// ---- VOICE_DEBUG_LOG: curated, secret-free debug payload --------------------
+// The raw Vapi payload + request headers are a minefield of secrets and PII: the
+// x-vapi-secret and Authorization headers, SIP SHAKEN/STIR identity tokens (both
+// as structured headers AND embedded inside call.phoneCallProviderDetails.sip.raw),
+// a duplicate x-vapi-secret echoed in assistant.model.headers, plus carrier/account
+// SIDs and variableValues. Rather than redact that sprawl field-by-field, we build
+// an explicit allowlist of ONLY what debugging actually needs: the mapped messages
+// (so we can see "User's Keypad Entry: ..."), the caller/dialed numbers, and the
+// callId. Nothing else is ever read, so no secret can leak by construction.
+
+/** The narrow slice of the Vapi payload the debug helper is allowed to read. */
+export interface VoiceDebugPayload {
+  call?: {
+    id?: string;
+    phoneNumber?: { number?: string };
+    customer?: { number?: string };
+  };
+}
+
+export interface VoiceDebugInfo {
+  callId: string | undefined;
+  /** phoneNumber.number — the number the guest DIALED. */
+  dialedNumber: string | undefined;
+  /** customer.number — the caller's own number (guest PII, kept for debugging). */
+  callerNumber: string | undefined;
+  messageCount: number;
+  messages: ChatMessageList;
+}
+
+// Build the curated debug object from a NEWLY-constructed literal — never a view
+// onto req.body — so processing keeps using the untouched real payload. Only the
+// five fields below are copied out; headers, the SIP blob, the assistant-config
+// echo, variableValues and carrier SIDs are never referenced and cannot appear.
+export function buildVoiceDebugInfo(
+  payload: VoiceDebugPayload,
+  mapped: ChatMessageList,
+  callId?: string
+): VoiceDebugInfo {
+  return {
+    callId: callId ?? payload.call?.id,
+    dialedNumber: payload.call?.phoneNumber?.number,
+    callerNumber: payload.call?.customer?.number,
+    messageCount: mapped.length,
+    messages: mapped,
+  };
+}
+
 // The concierge net: turn the brain's candidate reply into something safe to
 // speak. If a booking link is present it is replaced wholesale with a bilingual
 // invitation to call (TODO Bloc B: a voice-specific prompt should avoid links at
