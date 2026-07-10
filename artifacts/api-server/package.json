@@ -8,6 +8,7 @@
     "build": "pnpm --filter @workspace/motel-refuge run build && node ./build.mjs",
     "start": "node --enable-source-maps ./dist/index.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit",
+    "pretest": "node ./test-context.mjs",
     "test": "tsx --test \"src/**/*.test.ts\""
   },
   "dependencies": {
