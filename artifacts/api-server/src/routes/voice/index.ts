@@ -9,6 +9,7 @@ import {
   extractProvidedSecret,
   toSpokenReply,
   formatSsePayload,
+  buildVoiceDebugInfo,
   DEFAULT_VAPI_SECRET_HEADER,
   type VapiMessage,
 } from "./concierge";
@@ -56,17 +57,6 @@ const handleVoiceChat: import("express").RequestHandler = async (req, res) => {
   try {
     const body = req.body as VapiChatBody;
 
-    // Debug capture (opt-in): log the raw body AND headers BEFORE any processing
-    // — this is how we confirm the exact call.phoneNumber.number path and the
-    // auth header name on the first real test call. Off by default; headers may
-    // contain the shared secret, so only enable this on a controlled test.
-    if (process.env.VOICE_DEBUG_LOG === "true") {
-      req.log.info(
-        { rawHeaders: req.headers, rawBody: body },
-        "voice: raw Vapi payload (VOICE_DEBUG_LOG)"
-      );
-    }
-
     // ---- Auth: shared secret ----
     if (!VAPI_SECRET) {
       // Not configured — allow in dev, but make the gap loud (same spirit as the
@@ -102,6 +92,18 @@ const handleVoiceChat: import("express").RequestHandler = async (req, res) => {
     if (mapped.length === 0) {
       res.status(400).json({ error: "Invalid request: no user/assistant messages" });
       return;
+    }
+
+    // Debug capture (opt-in): log a CURATED, secret-free subset — the mapped
+    // messages (so we can see "User's Keypad Entry: ..."), caller/dialed numbers,
+    // and callId. Built from an explicit allowlist (buildVoiceDebugInfo), so no
+    // header, x-vapi-secret, Authorization, SIP identity token, assistant-config
+    // echo, or carrier SID can ever reach the logger. Off by default.
+    if (process.env.VOICE_DEBUG_LOG === "true") {
+      req.log.info(
+        buildVoiceDebugInfo(body, mapped, callId),
+        "voice: curated debug info (VOICE_DEBUG_LOG)"
+      );
     }
 
     // ---- Same brain as web chat ----

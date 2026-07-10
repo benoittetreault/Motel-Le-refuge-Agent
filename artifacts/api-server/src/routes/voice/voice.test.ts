@@ -7,6 +7,7 @@ import {
   toSpokenReply,
   buildSseChunks,
   formatSsePayload,
+  buildVoiceDebugInfo,
 } from "./concierge";
 
 test("mapVapiMessages keeps only user/assistant text, drops system and tool", () => {
@@ -130,4 +131,93 @@ test("formatSsePayload: data-prefixed lines, valid JSON, [DONE] terminator", () 
 
   // The reply text must never appear outside a JSON string (no raw injection).
   assert.equal(frames[3], "data: [DONE]");
+});
+
+// A payload shaped like a real Vapi turn: the fields we WANT alongside the
+// sprawl of secrets/PII we must never log (headers, SIP identity token embedded
+// in a raw blob, the assistant-config echo carrying a duplicate x-vapi-secret,
+// carrier SIDs, variableValues).
+const SPRAWLING_VAPI_PAYLOAD = {
+  model: "gpt-4",
+  messages: [
+    { role: "system", content: "Vapi prompt to ignore" },
+    { role: "user", content: "Je veux réserver" },
+    { role: "user", content: "User's Keypad Entry: 8194379713" },
+  ],
+  call: {
+    id: "call-abc-123",
+    phoneNumber: { number: "+18195649005" },
+    customer: { number: "+18194379713" },
+    phoneCallProviderDetails: {
+      sip: {
+        raw: 'INVITE sip:...;Identity: "eyJhbGciOiJFUzI1Ni000SHAKEN-STIR-IDENTITY-TOKEN"',
+      },
+      accountSid: "ACdeadbeefdeadbeefdeadbeefdeadbeef",
+    },
+    assistant: {
+      model: {
+        provider: "custom-llm",
+        headers: { "x-vapi-secret": "SUPER_SECRET_SHARED_VALUE" },
+      },
+    },
+    variableValues: { foo: "bar" },
+  },
+  headers: {
+    "x-vapi-secret": "SUPER_SECRET_SHARED_VALUE",
+    authorization: "Bearer SUPER_SECRET_BEARER_TOKEN",
+    identity: "SHAKEN-STIR-IDENTITY-TOKEN",
+  },
+};
+
+test("buildVoiceDebugInfo keeps only the curated fields, no secrets/PII sprawl", () => {
+  const mapped = mapVapiMessages(SPRAWLING_VAPI_PAYLOAD.messages);
+  const info = buildVoiceDebugInfo(SPRAWLING_VAPI_PAYLOAD, mapped, "call-abc-123");
+
+  // What we DO want: the mapped messages (incl. the keypad entry), the caller
+  // number, the dialed number, callId, and a count.
+  assert.equal(info.callId, "call-abc-123");
+  assert.equal(info.dialedNumber, "+18195649005");
+  assert.equal(info.callerNumber, "+18194379713");
+  assert.equal(info.messageCount, 2);
+  assert.deepEqual(info.messages, [
+    { role: "user", content: "Je veux réserver" },
+    { role: "user", content: "User's Keypad Entry: 8194379713" },
+  ]);
+  assert.ok(
+    info.messages.some((m) => String(m.content).includes("Keypad Entry")),
+    "the keypad entry must be visible in the debug info"
+  );
+
+  // What must NEVER be present: assert on both the shape (no stray keys) and the
+  // fully-serialized blob (no secret/identity value survives anywhere within).
+  assert.deepEqual(Object.keys(info).sort(), [
+    "callId",
+    "callerNumber",
+    "dialedNumber",
+    "messageCount",
+    "messages",
+  ]);
+
+  const serialized = JSON.stringify(info);
+  for (const forbidden of [
+    "x-vapi-secret",
+    "SUPER_SECRET_SHARED_VALUE",
+    "authorization",
+    "Bearer",
+    "SUPER_SECRET_BEARER_TOKEN",
+    "identity",
+    "SHAKEN-STIR-IDENTITY-TOKEN",
+    "sip",
+    "phoneCallProviderDetails",
+    "assistant",
+    "accountSid",
+    "ACdeadbeefdeadbeefdeadbeefdeadbeef",
+    "variableValues",
+  ]) {
+    assert.doesNotMatch(
+      serialized,
+      new RegExp(forbidden, "i"),
+      `curated debug info must not contain "${forbidden}"`
+    );
+  }
 });
