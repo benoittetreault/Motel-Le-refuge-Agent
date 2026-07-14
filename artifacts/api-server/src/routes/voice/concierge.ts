@@ -105,6 +105,36 @@ export function buildVoiceDebugInfo(
   };
 }
 
+// ---- Keypad phone extraction (DTMF → E.164) ---------------------------------
+// On the voice channel the guest keys a callback number on the phone dial pad and
+// Vapi injects it as a user message whose content looks like
+// "User's Keypad Entry: 5551234567". We deliberately do NOT hard-match that exact
+// wrapper text (Vapi could reword it); instead we strip every non-digit character
+// from the content and judge the resulting digit string purely on length. The
+// same entry can land in history MORE THAN ONCE — a DTMF inter-digit timeout and
+// the "#" terminator both inject it — so scanning backward and returning the
+// first valid hit naturally dedupes without special-casing.
+//
+// Only role "user" messages are considered: an assistant turn that happens to
+// contain digits (a price, a date) is never the guest's number. The length guard
+// is strict so ordinary numeric chatter ("September 10", "we are 2 people", a
+// truncated 7-digit entry) can never be misread as a phone number:
+//   - exactly 10 digits             → North American number, prepend "+1"
+//   - exactly 11 digits, leading "1" → already country-coded, prepend "+"
+//   - anything else                  → not a phone number, keep scanning backward
+// Returns the most recent valid number in E.164, or null if history has none.
+export function extractKeypadPhone(messages: ChatMessageList): string | null {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i];
+    if (m.role !== "user") continue;
+    if (typeof m.content !== "string") continue;
+    const digits = m.content.replace(/\D/g, "");
+    if (digits.length === 10) return `+1${digits}`;
+    if (digits.length === 11 && digits.startsWith("1")) return `+${digits}`;
+  }
+  return null;
+}
+
 // The concierge net: turn the brain's candidate reply into something safe to
 // speak. If a booking link is present it is replaced wholesale with a bilingual
 // invitation to call (TODO Bloc B: a voice-specific prompt should avoid links at
