@@ -8,7 +8,9 @@ import {
   buildSseChunks,
   formatSsePayload,
   buildVoiceDebugInfo,
+  extractKeypadPhone,
 } from "./concierge";
+import type { ChatMessageList } from "../anthropic/chat-brain";
 
 test("mapVapiMessages keeps only user/assistant text, drops system and tool", () => {
   const mapped = mapVapiMessages([
@@ -220,4 +222,90 @@ test("buildVoiceDebugInfo keeps only the curated fields, no secrets/PII sprawl",
       `curated debug info must not contain "${forbidden}"`
     );
   }
+});
+
+// ---- extractKeypadPhone (DTMF → E.164) ---------------------------------------
+
+test("extractKeypadPhone: a valid 10-digit keypad entry becomes +1XXXXXXXXXX", () => {
+  const history: ChatMessageList = [
+    { role: "user", content: "Je veux réserver" },
+    { role: "user", content: "User's Keypad Entry: 5195551234" },
+  ];
+  assert.equal(extractKeypadPhone(history), "+15195551234");
+});
+
+test("extractKeypadPhone: an 11-digit entry starting with 1 becomes +1XXXXXXXXXX", () => {
+  const history: ChatMessageList = [
+    { role: "user", content: "User's Keypad Entry: 15195551234" },
+  ];
+  assert.equal(extractKeypadPhone(history), "+15195551234");
+});
+
+test("extractKeypadPhone: tolerant of a reworded wrapper (digits-only guard)", () => {
+  // We must NOT hard-match "User's Keypad Entry:" — any wording works because we
+  // strip to digits. Formatting punctuation in the number is stripped too.
+  const history: ChatMessageList = [
+    { role: "user", content: "Numéro saisi au clavier => (519) 555-1234" },
+  ];
+  assert.equal(extractKeypadPhone(history), "+15195551234");
+});
+
+test("extractKeypadPhone: a date-fragment user message is rejected, not misread", () => {
+  // "September 10" has digits but far fewer than 10 → the length guard rejects it.
+  const history: ChatMessageList = [
+    { role: "user", content: "September 10" },
+    { role: "user", content: "we are 2 people" },
+  ];
+  assert.equal(extractKeypadPhone(history), null);
+});
+
+test("extractKeypadPhone: the same entry appearing twice returns the number once", () => {
+  // A DTMF inter-digit timeout AND the "#" terminator both inject the entry.
+  const history: ChatMessageList = [
+    { role: "user", content: "User's Keypad Entry: 5195551234" },
+    { role: "user", content: "User's Keypad Entry: 5195551234" },
+  ];
+  assert.equal(extractKeypadPhone(history), "+15195551234");
+});
+
+test("extractKeypadPhone: an assistant message with digits is ignored", () => {
+  // Only role "user" is scanned; the assistant quoting a 10-digit-looking string
+  // must never be taken as the guest's number.
+  const history: ChatMessageList = [
+    { role: "assistant", content: "Votre confirmation est le 5195551234." },
+  ];
+  assert.equal(extractKeypadPhone(history), null);
+});
+
+test("extractKeypadPhone: empty history returns null", () => {
+  assert.equal(extractKeypadPhone([]), null);
+});
+
+test("extractKeypadPhone: a too-short 7-digit entry is rejected (returns null)", () => {
+  // Partial entries (like the sample "5551234") are not real numbers and must
+  // never produce a bad "+1" — we return null rather than guess.
+  const history: ChatMessageList = [
+    { role: "user", content: "User's Keypad Entry: 5551234" },
+  ];
+  assert.equal(extractKeypadPhone(history), null);
+});
+
+test("extractKeypadPhone: an 11-digit entry NOT starting with 1 is rejected", () => {
+  const history: ChatMessageList = [
+    { role: "user", content: "User's Keypad Entry: 25195551234" },
+  ];
+  assert.equal(extractKeypadPhone(history), null);
+});
+
+test("extractKeypadPhone: found by scanning backward past later user turns", () => {
+  // The valid entry sits a few messages back, behind later "yes"/"book it" turns
+  // that contain no valid number — backward scan still finds it.
+  const history: ChatMessageList = [
+    { role: "user", content: "Bonjour, je veux une chambre" },
+    { role: "user", content: "User's Keypad Entry: 8195551234" },
+    { role: "assistant", content: "Parfait, je note le 819..." },
+    { role: "user", content: "yes" },
+    { role: "user", content: "book it" },
+  ];
+  assert.equal(extractKeypadPhone(history), "+18195551234");
 });
