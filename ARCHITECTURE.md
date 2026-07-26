@@ -256,6 +256,26 @@ toute la logique SMS vit dans la route voix. **Reste optionnel (nécessiterait g
 Benoit)** : un prompt vocal dédié (phrases courtes TTS, lien-free à la source, First Message
 Vapi) — non requis pour la correction, l'approche concierge le rend superflu.
 
+### 8.1 Latence voix — dédup dispo + deadline (correctif live)
+
+Défaut observé (pr-27-test) : ~22 s de traitement, Vapi abandonne à ~20 s
+(`providerfault-model-no-response`). Corrigé sur trois axes :
+- **Dédup dispo intra-requête** : `createRequestAvailability` (availability.ts) mémoïse la
+  **promesse** par `arrivalDate+nights+adults`, partagée entre la boucle d'outils de
+  `generateReply` et l'orchestrateur SMS ⇒ mêmes dates vérifiées **une seule fois** chez
+  Reservit. Validation **inchangée** (hôte/chemin/hotelid/date, URL reconstruite serveur) ; le
+  cache ne réutilise qu'un résultat correspondant **exactement** aux paramètres validés. Neuf à
+  chaque requête (jamais de cache inter-requêtes périmé).
+- **Deadline dure** : `createVoiceDeadline` (15 s) + `withDeadline` autour de tout le pipeline.
+  Si on ne finit pas à temps ⇒ repli parlé **invitation à appeler** (jamais de dispo ni d'SMS
+  prétendus), bien avant les 20 s de Vapi. Cible < 12 s, plafond 15 s.
+- **Pas d'SMS tardif ni faux** : l'orchestrateur reçoit `deadline` ; avant d'envoyer, il refuse
+  si expiré ou si < ~4,5 s de budget (release + invitation). Le `fetch` Twilio reçoit aussi
+  `deadline.signal` ⇒ un envoi en vol s'annule à l'échéance.
+- **Instrumentation** : log `voice: request timing` sans PII — `{ totalMs, timedOut, timings }`
+  (agrégats `model_round` / `check_availability` / `availability_cache_hit` / `reservit_night` /
+  `generate_reply` / `orchestrate_sms` / `sse_write`, durées et compteurs uniquement).
+
 ## 9. Limites connues & questions ouvertes
 
 - **Compte d'inventaire réel / même-type multi** : `bestprice` ne donne pas le nombre de

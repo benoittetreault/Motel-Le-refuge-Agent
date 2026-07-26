@@ -30,7 +30,15 @@ import {
 import type { SmsResult } from "../../lib/sms";
 import type { ChatMessageList } from "../anthropic/chat-brain";
 import type { SentLinkStore } from "./sent-link-store";
+import type { DeadlineView } from "./deadline";
 import { inviteToCallReply, smsSentReply, resolveGuestPhone, type SpokenReplyOpts } from "./concierge";
+
+// Minimum time we insist on having left before STARTING a Twilio send: the
+// provider call itself is bounded at ~4s, so if less than this remains we would
+// risk finishing (and confirming) after the voice deadline. In that case we do
+// not send at all and invite the guest to call — never a send we can't confirm
+// in time, never a false claim.
+const SMS_MIN_BUDGET_MS = 4500;
 
 // Injected side-effecting dependencies. The route passes the real
 // checkAvailability / sendBookingLinkSms / singleton store; tests pass fakes.
@@ -60,6 +68,12 @@ export interface BookingSmsInput {
   /** Trusted booking config (hotel id + link base) for server-side rebuilding. */
   bookingConfig: BookingConfig;
   spokenOpts: SpokenReplyOpts;
+  /**
+   * Optional voice processing deadline. When present, we refuse to START an SMS
+   * send that cannot finish and be confirmed before it — so a late send never
+   * fires after the guest has already heard the fallback.
+   */
+  deadline?: DeadlineView;
 }
 
 // Machine-readable outcome for structured logging. No secrets, no phone numbers,
@@ -72,6 +86,7 @@ export type BookingSmsStatus =
   | "invalid_link" // a link failed strict validation (bad host/path/hotelid/params).
   | "missing_call_id" // no stable call id → cannot dedup, so we do not send.
   | "no_number" // no verified/keyed guest number to text.
+  | "deadline_exceeded" // not enough time left to safely send before the voice deadline.
   | "send_failed"; // Twilio (or config) failure.
 
 export interface BookingSmsOutcome {
@@ -150,8 +165,18 @@ export async function orchestrateBookingSms(
   // We now hold the claim. From here, every non-success path must release it so
   // a later turn can retry.
   try {
-    // 3. Server-side availability re-verification (validated params). Only a
-    //    definitive negative blocks.
+    // 3. Resolve the guest's number FIRST (cheap, no network). If there is none
+    //    we will not send, so we skip the availability round-trip entirely — this
+    //    is the common browser-webCall case and a key latency win.
+    const toNumber = resolveGuestPhone(callerNumber, messages);
+    if (!toNumber) {
+      deps.store.release(callId, key);
+      return invite("no_number");
+    }
+
+    // 4. Server-side availability re-verification (validated params, memoized per
+    //    request so dates already checked in the model loop aren't re-fetched).
+    //    Only a definitive negative blocks.
     const results = await Promise.all(
       bookings.map((b) => deps.checkAvailability(b.arrivalDate, b.nights, b.adults))
     );
@@ -160,11 +185,13 @@ export async function orchestrateBookingSms(
       return invite("not_available");
     }
 
-    // 4. Resolve the guest's number (verified metadata, then DTMF keypad).
-    const toNumber = resolveGuestPhone(callerNumber, messages);
-    if (!toNumber) {
+    // 4b. Deadline check — do NOT start a send we can't finish and confirm before
+    //     the voice deadline. Otherwise a late SMS could fire after the guest has
+    //     already heard the fallback. Release the claim so a later turn may retry.
+    const { deadline } = input;
+    if (deadline && (deadline.expired() || deadline.remainingMs() < SMS_MIN_BUDGET_MS)) {
       deps.store.release(callId, key);
-      return invite("no_number");
+      return invite("deadline_exceeded");
     }
 
     // 5. Send the canonical (server-built) link(s). sendSms never throws.

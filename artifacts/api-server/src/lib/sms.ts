@@ -47,7 +47,8 @@ function warn(logger: WarnLogger | undefined, obj: unknown, msg: string): void {
 export async function sendBookingLinkSms(
   toNumber: string,
   body: string,
-  logger?: WarnLogger
+  logger?: WarnLogger,
+  externalSignal?: AbortSignal
 ): Promise<SmsResult> {
   // 1. Credentials — read here, not at module scope, so importing this module
   // never requires Twilio to be configured (keeps it unit-testable). We never
@@ -76,9 +77,15 @@ export async function sendBookingLinkSms(
   const form = new URLSearchParams({ To: toNumber, From: fromNumber, Body: body });
 
   // 3-4. Send, bounded by a timeout via AbortController (mirrors availability.ts,
-  // including the try/finally clearTimeout).
+  // including the try/finally clearTimeout). An optional externalSignal (the voice
+  // deadline) can abort the in-flight send too, so a late request never completes
+  // after the guest has already heard the fallback.
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), TWILIO_TIMEOUT_MS);
+  const signal =
+    externalSignal !== undefined
+      ? AbortSignal.any([controller.signal, externalSignal])
+      : controller.signal;
 
   try {
     const res = await fetch(url, {
@@ -89,7 +96,7 @@ export async function sendBookingLinkSms(
         Accept: "application/json",
       },
       body: form.toString(),
-      signal: controller.signal,
+      signal,
     });
 
     // 5. Non-2xx: log the HTTP status and Twilio's numeric error CODE only — the

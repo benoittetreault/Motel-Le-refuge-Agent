@@ -333,3 +333,56 @@ test("missing call id → missing_call_id, no SMS attempted", async () => {
   assert.equal(rec.availabilityCalls.length, 0);
   assertNoUrl(outcome.reply);
 });
+
+// ---- Voice deadline (no late / no false-claim SMS) --------------------------
+
+// A deadline view stub with fully controllable expiry / remaining budget.
+function deadlineStub(opts: { expired: boolean; remainingMs: number }) {
+  return { expired: () => opts.expired, remainingMs: () => opts.remainingMs };
+}
+
+test("expired deadline → no SMS sent, no claim of success (invite instead)", async () => {
+  const store = createSentLinkStore();
+  const rec: Recorder = { availabilityCalls: [], smsCalls: [] };
+  const deps = makeDeps({ store, rec });
+
+  const outcome = await orchestrateBookingSms(
+    baseInput({ deadline: deadlineStub({ expired: true, remainingMs: 0 }) }),
+    deps
+  );
+
+  assert.equal(outcome.status, "deadline_exceeded");
+  assert.equal(rec.smsCalls.length, 0, "no late SMS after the deadline");
+  assert.doesNotMatch(outcome.reply, /texto|text message/i); // never claims a send
+  assert.match(outcome.reply, /appelez-nous|call us/i);
+  assertNoUrl(outcome.reply);
+  // The claim was released (no send happened) so a later turn could retry.
+  assert.equal(store.claim("call-1", "any-other-key"), "claimed");
+});
+
+test("too little time left to safely send → no SMS, invite instead", async () => {
+  const rec: Recorder = { availabilityCalls: [], smsCalls: [] };
+  const deps = makeDeps({ rec });
+
+  // Not expired, but under the ~4.5s minimum budget to start+confirm a send.
+  const outcome = await orchestrateBookingSms(
+    baseInput({ deadline: deadlineStub({ expired: false, remainingMs: 1000 }) }),
+    deps
+  );
+
+  assert.equal(outcome.status, "deadline_exceeded");
+  assert.equal(rec.smsCalls.length, 0);
+});
+
+test("ample time left → sends normally", async () => {
+  const rec: Recorder = { availabilityCalls: [], smsCalls: [] };
+  const deps = makeDeps({ rec });
+
+  const outcome = await orchestrateBookingSms(
+    baseInput({ deadline: deadlineStub({ expired: false, remainingMs: 12_000 }) }),
+    deps
+  );
+
+  assert.equal(outcome.status, "sent");
+  assert.equal(rec.smsCalls.length, 1);
+});

@@ -71,6 +71,17 @@ already safe in code, not only by documentation.
 - **`VOICE_DEBUG_LOG` blocked in production** via `voiceDebugEnabled` (flag must be `"true"` AND `NODE_ENV !== "production"`), so an accidentally-on flag cannot leak PII in prod.
 - **`check_failed` is never called "verified."** Reservit-unreachable is non-blocking but explicitly not a verification claim.
 
+## Live latency fix (PR #27, found on pr-27-test)
+
+A browser webCall (`callId 019f9f4b…`) took ~22.2s server-side; Vapi abandoned the turn at its ~20s provider timeout (`providerfault-model-no-response`). Twilio was not involved (`no_number`). Two causes and a safety net:
+
+- **Duplicate availability check removed.** The model tool-loop checked availability, then `orchestrateBookingSms` re-checked the same dates before texting — two identical Reservit round-trips. Added `createRequestAvailability` (availability.ts): a **request-scoped, promise-memoized** wrapper keyed exactly by `arrivalDate+nights+adults`, shared by `generateReply`'s tool loop and the orchestrator. Same dates → one network check. Validation is **unchanged** (host/path/hotelid/date still enforced, URL still rebuilt server-side); a cache hit only reuses a result for exactly the params validated from the server-built link. Fresh per request — never a stale cross-request cache.
+- **Hard voice deadline.** `createVoiceDeadline` (15s) + `withDeadline` wrap the whole pipeline. If it can't finish, we speak a safe **invite-to-call** fallback (never claims availability or an SMS) well before Vapi's 20s. Target <12s, hard ceiling 15s.
+- **No late / no false SMS.** The orchestrator takes a `deadline`; before starting a send it refuses if expired or if < ~4.5s budget remains (releases the claim, invites to call). The Twilio fetch also receives `deadline.signal`, so any in-flight send aborts at the deadline. A timeout can never produce a "sent" claim, and no SMS fires after the guest has heard the fallback.
+- **Instrumentation.** Secret-free per-request duration log `voice: request timing` — `{ totalMs, timedOut, timings }` where `timings` aggregates `model_round`, `check_availability`, `availability_cache_hit`, `reservit_night`, `generate_reply`, `orchestrate_sms`, `sse_write` (counts/durations only, no PII).
+
+New/changed for this fix: `timing.ts`(+test), `deadline.ts`(+test), `availability.ts`(+`availability.test.ts`), `chat-brain.ts` (inject availability + timing), `booking-sms.ts` (deadline gate), `sms.ts` (optional abort signal), `voice/index.ts` (wire it all).
+
 ## Architecture decisions
 
 - **Concierge-net, not prompt rework.** Keeps the golden prompt frozen and makes the SMS
@@ -82,7 +93,7 @@ already safe in code, not only by documentation.
 
 ## Tests executed & results (run from the worktree)
 
-- `pnpm --filter @workspace/api-server test` → **99 pass / 0 fail** (Bloc B/C + log-redaction + PR-27 hardening).
+- `pnpm --filter @workspace/api-server test` → **117 pass / 0 fail** (Bloc B/C + log-redaction + hardening + latency fix).
 - `pnpm --filter @workspace/api-server typecheck` (after `npx tsc -b tsconfig.json`) → **exit 0**.
 - `node artifacts/api-server/build.mjs` (prod esbuild server bundle) → **exit 0**.
 - No lint step is configured in this repo.

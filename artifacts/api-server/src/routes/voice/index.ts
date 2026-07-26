@@ -3,16 +3,19 @@ import { randomUUID } from "node:crypto";
 import { getMotelConfig } from "@workspace/motel-config";
 import { generateReply } from "../anthropic/chat-brain";
 import { findAllReservitLinks } from "../anthropic/reservit-link";
-import { checkAvailability } from "../anthropic/availability";
+import { checkAvailability, createRequestAvailability } from "../anthropic/availability";
 import { sendBookingLinkSms } from "../../lib/sms";
 import { maskPhone } from "../../lib/redact";
 import { orchestrateBookingSms } from "./booking-sms";
 import { sentLinkStore } from "./sent-link-store";
+import { createTimings } from "./timing";
+import { createVoiceDeadline, withDeadline } from "./deadline";
 import {
   mapVapiMessages,
   secretMatches,
   extractProvidedSecret,
   toSpokenReply,
+  inviteToCallReply,
   formatSsePayload,
   buildVoiceDebugInfo,
   voiceDebugEnabled,
@@ -62,8 +65,14 @@ interface VapiChatBody {
 const VAPI_SECRET = process.env.VAPI_SECRET;
 const VAPI_SECRET_HEADER = process.env.VAPI_SECRET_HEADER ?? DEFAULT_VAPI_SECRET_HEADER;
 
+// Hard internal processing deadline. Vapi abandons a turn at ~20s; we cap well
+// under that so we always answer (with the real reply or a safe fallback) before
+// Vapi times out. Target is < 12s; 15s is the hard ceiling.
+const VOICE_DEADLINE_MS = 15_000;
+
 // Shared handler for both route aliases (see registration below).
 const handleVoiceChat: import("express").RequestHandler = async (req, res) => {
+  const requestStart = Date.now();
   try {
     const body = req.body as VapiChatBody;
 
@@ -130,49 +139,80 @@ const handleVoiceChat: import("express").RequestHandler = async (req, res) => {
       );
     }
 
-    // ---- Same brain as web chat ----
-    // check_availability runs internally here; Vapi never sees our tools and we
-    // never return tool_calls to it.
-    const candidate = await generateReply(mapped);
-
-    // ---- Concierge net + SMS orchestration (Bloc B/C) ----
-    // A booking link must never be SPOKEN. Two cases:
-    //   • No link  → speak the candidate as-is (tool-tags stripped by toSpokenReply).
-    //   • Link(s)  → hand off to orchestrateBookingSms, which re-verifies
-    //     availability, resolves the guest's number (verified metadata → DTMF),
-    //     texts the link via Twilio (deduped per call), and returns a SAFE
-    //     spoken reply: the "sent by text" confirmation ONLY after a successful
-    //     send, otherwise an invite-to-call. The URL is never spoken.
     const spokenOpts = {
       phone: motel.identity.phone,
       hours: motel.hours.receptionLabel,
     };
-    const links = findAllReservitLinks(candidate);
-    let reply: string;
-    if (links.length === 0) {
-      reply = toSpokenReply(candidate, spokenOpts);
-    } else {
-      const outcome = await orchestrateBookingSms(
-        {
-          links,
-          callId,
-          callerNumber,
-          messages: mapped,
-          motelName: motel.identity.name,
-          bookingConfig: { hotelId: motel.booking.hotelId, linkBase: motel.booking.linkBase },
-          spokenOpts,
-        },
-        {
-          checkAvailability,
-          sendSms: (to, smsBody) => sendBookingLinkSms(to, smsBody, req.log),
-          store: sentLinkStore,
-        }
+
+    // ---- Latency instrumentation + processing deadline ----
+    // Per-request timing sink (durations only, never PII) and a hard deadline so
+    // we always answer before Vapi's ~20s provider timeout.
+    const timings = createTimings();
+    const deadline = createVoiceDeadline(VOICE_DEADLINE_MS);
+    // Request-scoped, memoized availability shared by the model tool-loop AND the
+    // SMS orchestrator — the same dates are checked against Reservit only once.
+    const availability = createRequestAvailability(
+      (a, n, ad) => checkAvailability(a, n, ad, timings.add),
+      timings.add
+    );
+
+    // The full "produce the spoken reply" pipeline. Runs under the deadline; if it
+    // can't finish in time, withDeadline resolves the safe fallback instead.
+    const produceReply = async (): Promise<string> => {
+      // Same brain as web chat; check_availability runs internally (memoized).
+      const candidate = await timings.time("generate_reply", () =>
+        generateReply(mapped, true, availability, timings.add)
       );
-      reply = outcome.reply;
+
+      // A booking link must never be SPOKEN. No link → speak the candidate as-is;
+      // link(s) → orchestrator validates+rebuilds server-side, re-verifies (reusing
+      // the memoized availability), texts via Twilio, and returns a SAFE reply
+      // (URL never spoken; "sent" only after a successful send).
+      const links = findAllReservitLinks(candidate);
+      if (links.length === 0) return toSpokenReply(candidate, spokenOpts);
+
+      const outcome = await timings.time("orchestrate_sms", () =>
+        orchestrateBookingSms(
+          {
+            links,
+            callId,
+            callerNumber,
+            messages: mapped,
+            motelName: motel.identity.name,
+            bookingConfig: { hotelId: motel.booking.hotelId, linkBase: motel.booking.linkBase },
+            spokenOpts,
+            deadline,
+          },
+          {
+            checkAvailability: availability,
+            sendSms: (to, smsBody) => sendBookingLinkSms(to, smsBody, req.log, deadline.signal),
+            store: sentLinkStore,
+          }
+        )
+      );
       // Structured, secret-free outcome log (no number, no URL, no token).
       req.log.info(
         { callId, smsStatus: outcome.status, smsReason: outcome.smsReason },
         "voice: booking-link SMS outcome"
+      );
+      return outcome.reply;
+    };
+
+    let timedOut = false;
+    let reply: string;
+    try {
+      reply = await withDeadline(produceReply(), deadline, () => {
+        timedOut = true;
+        // Safe fallback: invite to call. Never claims availability or an SMS.
+        return inviteToCallReply(spokenOpts);
+      });
+    } finally {
+      deadline.clear();
+    }
+    if (timedOut) {
+      req.log.warn(
+        { callId, deadlineMs: VOICE_DEADLINE_MS },
+        "voice: processing deadline exceeded — safe fallback spoken"
       );
     }
 
@@ -186,6 +226,7 @@ const handleVoiceChat: import("express").RequestHandler = async (req, res) => {
     // we simply wrap it as SSE (single content chunk), so no logic or safety
     // changes upstream. Error paths above already returned JSON before we get
     // here, so no SSE headers were set on those.
+    const sseStart = Date.now();
     res.setHeader("Content-Type", "text/event-stream");
     res.setHeader("Cache-Control", "no-cache");
     res.setHeader("Connection", "keep-alive");
@@ -197,6 +238,13 @@ const handleVoiceChat: import("express").RequestHandler = async (req, res) => {
       })
     );
     res.end();
+    timings.add("sse_write", Date.now() - sseStart);
+
+    // Secret-free latency summary (durations/counts only — no PII).
+    req.log.info(
+      { callId, timedOut, totalMs: Date.now() - requestStart, timings: timings.summary() },
+      "voice: request timing"
+    );
   } catch (err) {
     req.log.error({ err }, "voice: failed to handle turn");
     res.status(500).json({ error: "Failed to handle voice turn" });
