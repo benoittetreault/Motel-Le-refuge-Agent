@@ -114,11 +114,12 @@ Vapi gère la **téléphonie** (ASR voix→texte, TTS texte→voix). Notre api-s
     → toute réponse contenant un lien est remplacée par une invitation bilingue à appeler
     (`phone` + heures) ; liens résiduels + tags d'outil strippés dans tous les cas.
   - `buildSseChunks` / `formatSsePayload` : formatage SSE (cf. §6.1).
-- **Flux du handler** : (debug opt-in) log headers+body bruts si `VOICE_DEBUG_LOG=true` →
-  **auth** (401 si secret invalide ; si `VAPI_SECRET` absent → warning + passage, dev only)
-  → extrait/log `call.phoneNumber.number` (appelé), `call.customer.number` (appelant),
-  `call.id` → `getMotelConfig(dialedNumber)` → `mapVapiMessages` (400 si vide) →
-  `generateReply` (**même cerveau que le web**) → `toSpokenReply` → réponse **SSE**.
+- **Flux du handler** : **auth** (401 si secret invalide ; si `VAPI_SECRET` absent → warning +
+  passage, dev only) → extrait `call.phoneNumber.number` (appelé), `call.customer.number`
+  (appelant), `call.id` ; le log normal « voice: incoming turn » **masque les numéros**
+  (`maskPhone` → `+1******1234`) → `getMotelConfig(dialedNumber)` → `mapVapiMessages` (400 si
+  vide) → (debug opt-in `VOICE_DEBUG_LOG=true`, cf. §6.5) → `generateReply` (**même cerveau que
+  le web**) → filet concierge / SMS (§8) → réponse **SSE**.
 - **Pas de persistance DB** en voix : Vapi renvoie l'historique **complet** à chaque tour.
 - **Jamais de `tool_calls` renvoyés à Vapi** : `check_availability` reste interne à
   `generateReply` (invisible pour Vapi).
@@ -167,6 +168,27 @@ Le header par défaut correspond à la config Vapi actuelle.
   montre `model.headers` contenant la clé (PAS `isServerUrlSecretSet`, qui concerne autre chose).
 - **Numéros gratuits Vapi ≠ indicatifs canadiens** : impossible d'obtenir un vrai numéro
   819 via les numéros gratuits Vapi → nécessitera « Import Twilio » plus tard.
+
+### 6.5 Redaction des logs — numéros invités & secrets
+
+Les **logs normaux (toujours actifs)** ne doivent JAMAIS contenir un numéro invité complet, le
+corps du SMS / lien de réservation, un token/SID Twilio, ni une valeur d'autorisation.
+
+- **Helper `maskPhone`** (`lib/redact.ts`, réutilisable, pur) : `+15195551234` → `+1******1234`
+  (garde 2 premiers + 4 derniers, masque le milieu ; entrée non-string/vide → `<no-number>` ;
+  ≤ 6 caractères → entièrement masqué). Utilisé par le log « voice: incoming turn » et par
+  `sms.ts` (chemin `invalid_input`).
+- **`sms.ts`** : sur non-2xx, on log **uniquement** `status` + `twilioCode` (code numérique
+  extrait du body), jamais le body brut (qui ré-échoit le numéro). Sur 2xx sans `sid`, on log
+  **les noms de champs** (`responseKeys`) et non leurs valeurs (le body Twilio contient `to` et
+  notre `body`=lien). Sur timeout/erreur réseau, on log **le nom** de l'erreur (`errName`), pas
+  l'objet brut (dont la stack/URL contient l'`accountSid`). L'en-tête `Authorization: Basic …`
+  n'est jamais loggé.
+- **`VOICE_DEBUG_LOG`** : opt-in, **désactivé par défaut** (env doit valoir exactement `"true"`).
+  Ce bloc log encore des **numéros complets + le texte des messages** (dont les saisies clavier).
+  Il **DOIT rester désactivé en production** — les logs toujours-actifs étant déjà masqués, la
+  prod est sûre sans ce flag ; ne l'activer que pour du débogage local court. La sécurité ne
+  repose PAS uniquement sur cette doc : les logs normaux sont masqués **dans le code**.
 
 ## 7. Décisions clés (et pourquoi)
 

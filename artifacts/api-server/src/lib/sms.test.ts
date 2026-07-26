@@ -144,6 +144,122 @@ test("generic network exception -> twilio_error, never throws", async () => {
   assert.deepEqual(result, { ok: false, reason: "twilio_error" });
 });
 
+// ---- Log-redaction harness --------------------------------------------------
+// A WarnLogger that records every (obj, msg) it is handed, so a test can assert
+// on exactly what would be written to the logs. `serialized` flattens all
+// recorded entries so a test can assert a sensitive value appears NOWHERE.
+interface LogEntry {
+  obj: unknown;
+  msg?: string;
+}
+function recordingLogger(): { entries: LogEntry[]; warn: (obj: unknown, msg?: string) => void; serialized(): string } {
+  const entries: LogEntry[] = [];
+  return {
+    entries,
+    warn(obj: unknown, msg?: string) {
+      entries.push({ obj, msg });
+    },
+    serialized() {
+      return JSON.stringify(entries);
+    },
+  };
+}
+
+const FULL_NUMBER = "15551234567"; // a complete number, used to prove it never leaks
+const BOOKING_URL =
+  "http://softbooker.reservit.com/reservit/reserhotel.php?lang=EN&hotelid=444801&fday=15&fmonth=09&fyear=2026&nbnights=2&nbadt=2";
+
+test("invalid-input log contains no complete number (masked instead)", async () => {
+  setValidEnv();
+  const log = recordingLogger();
+
+  const result = await sendBookingLinkSms(FULL_NUMBER, BOOKING_URL, log); // no leading "+"
+  assert.deepEqual(result, { ok: false, reason: "invalid_input" });
+
+  const out = log.serialized();
+  assert.doesNotMatch(out, new RegExp(FULL_NUMBER), "the complete number must not be logged");
+  assert.doesNotMatch(out, /reservit\.com/, "the booking URL/body must not be logged");
+  assert.match(out, /\*/, "a masked form should be present");
+});
+
+test("Twilio-error log has status + code, never the number or body", async () => {
+  setValidEnv();
+  // A realistic Twilio 400 whose message echoes the destination number.
+  fetchImpl = async () =>
+    jsonResponse(400, {
+      code: 21211,
+      message: `The 'To' number +${FULL_NUMBER} is not a valid phone number.`,
+      more_info: "https://www.twilio.com/docs/errors/21211",
+    });
+  const log = recordingLogger();
+
+  const result = await sendBookingLinkSms(`+${FULL_NUMBER}`, BOOKING_URL, log);
+  assert.deepEqual(result, { ok: false, reason: "twilio_error" });
+
+  const out = log.serialized();
+  assert.doesNotMatch(out, new RegExp(FULL_NUMBER), "Twilio error body must not leak the number");
+  assert.doesNotMatch(out, /is not a valid phone number/, "the raw Twilio message must not be logged");
+  assert.doesNotMatch(out, /reservit\.com/, "the booking URL/body must not be logged");
+  // Useful category IS preserved.
+  assert.match(out, /"status":400/);
+  assert.match(out, /"twilioCode":21211/);
+});
+
+test("2xx-without-sid log lists field names only, never their values", async () => {
+  setValidEnv();
+  // Twilio 2xx message resource that (abnormally) lacks a sid; it DOES carry the
+  // destination number and our booking-URL body.
+  fetchImpl = async () =>
+    jsonResponse(201, { to: `+${FULL_NUMBER}`, from: "+15005550006", body: BOOKING_URL });
+  const log = recordingLogger();
+
+  const result = await sendBookingLinkSms(`+${FULL_NUMBER}`, BOOKING_URL, log);
+  assert.deepEqual(result, { ok: false, reason: "twilio_error" });
+
+  const out = log.serialized();
+  assert.doesNotMatch(out, new RegExp(FULL_NUMBER), "the number value must not be logged");
+  assert.doesNotMatch(out, /reservit\.com/, "the booking URL/body value must not be logged");
+  // Field NAMES are fine (they are not sensitive) and aid debugging.
+  assert.match(out, /responseKeys/);
+  assert.match(out, /"to"/);
+  assert.match(out, /"body"/);
+});
+
+test("logs never contain Twilio credentials or authorization values", async () => {
+  const authSentinel = "AUTH_TOKEN_SENTINEL_NEVER_LOG";
+  const sidSentinel = "ACSIDSENTINELNEVERLOG0000000000000";
+  process.env.TWILIO_ACCOUNT_SID = sidSentinel;
+  process.env.TWILIO_AUTH_TOKEN = authSentinel;
+  process.env.TWILIO_FROM_NUMBER = "+15005550006";
+
+  const log = recordingLogger();
+
+  // Drive the network-failure path (raw error would previously be logged).
+  fetchImpl = async () => {
+    throw new Error(`connect ECONNREFUSED to https://api.twilio.com/2010-04-01/Accounts/${sidSentinel}/Messages.json`);
+  };
+  const result = await sendBookingLinkSms(`+${FULL_NUMBER}`, BOOKING_URL, log);
+  assert.deepEqual(result, { ok: false, reason: "twilio_error" });
+
+  const out = log.serialized();
+  assert.doesNotMatch(out, new RegExp(authSentinel), "auth token must never be logged");
+  assert.doesNotMatch(out, new RegExp(sidSentinel), "account SID (in the URL) must never be logged");
+  assert.doesNotMatch(out, /Basic /, "the Authorization header value must never be logged");
+  // Only the error category is kept.
+  assert.match(out, /"errName":"Error"/);
+});
+
+test("successful send logs nothing sensitive (no number, body, or sid leak)", async () => {
+  setValidEnv();
+  fetchImpl = async () => jsonResponse(201, { sid: "SMok" });
+  const log = recordingLogger();
+
+  const result = await sendBookingLinkSms(`+${FULL_NUMBER}`, BOOKING_URL, log);
+  assert.deepEqual(result, { ok: true, sid: "SMok" });
+  // Happy path warns about nothing.
+  assert.equal(log.entries.length, 0);
+});
+
 test("TWILIO_FAIL_SAFE is never read, even when set", async () => {
   setValidEnv();
   const sentinel = "FAIL_SAFE_SENTINEL_SHOULD_NEVER_APPEAR";

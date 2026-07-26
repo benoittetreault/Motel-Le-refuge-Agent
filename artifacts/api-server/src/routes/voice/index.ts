@@ -5,6 +5,7 @@ import { generateReply } from "../anthropic/chat-brain";
 import { findAllReservitLinks } from "../anthropic/reservit-link";
 import { checkAvailability } from "../anthropic/availability";
 import { sendBookingLinkSms } from "../../lib/sms";
+import { maskPhone } from "../../lib/redact";
 import { orchestrateBookingSms } from "./booking-sms";
 import { sentLinkStore } from "./sent-link-store";
 import {
@@ -86,7 +87,14 @@ const handleVoiceChat: import("express").RequestHandler = async (req, res) => {
     const dialedNumber = body.call?.phoneNumber?.number;
     const callerNumber = body.call?.customer?.number;
     const callId = body.call?.id;
-    req.log.info({ callId, dialedNumber, callerNumber }, "voice: incoming turn");
+    // Normal (always-on) log: numbers are MASKED here so a complete guest number
+    // never reaches production logs. The full values stay in local variables for
+    // routing/SMS use only. (The opt-in VOICE_DEBUG_LOG block below may expose
+    // full numbers by design — it must stay OFF in production.)
+    req.log.info(
+      { callId, dialedNumber: maskPhone(dialedNumber), callerNumber: maskPhone(callerNumber) },
+      "voice: incoming turn"
+    );
     // getMotelConfig ignores dialedNumber for now (single motel) but the wiring
     // is in place for when it resolves per-number.
     const motel = getMotelConfig(dialedNumber);
@@ -106,7 +114,14 @@ const handleVoiceChat: import("express").RequestHandler = async (req, res) => {
     // messages (so we can see "User's Keypad Entry: ..."), caller/dialed numbers,
     // and callId. Built from an explicit allowlist (buildVoiceDebugInfo), so no
     // header, x-vapi-secret, Authorization, SIP identity token, assistant-config
-    // echo, or carrier SID can ever reach the logger. Off by default.
+    // echo, or carrier SID can ever reach the logger.
+    //
+    // PRODUCTION WARNING: this block still logs COMPLETE guest phone numbers and
+    // raw message text (incl. keypad-entered numbers). It is guarded off by
+    // default (env must be exactly "true") and MUST remain disabled in
+    // production. The always-on logs above are already masked, so normal
+    // production logging is safe without this flag — enable it only for
+    // short-lived local debugging.
     if (process.env.VOICE_DEBUG_LOG === "true") {
       req.log.info(
         buildVoiceDebugInfo(body, mapped, callId),

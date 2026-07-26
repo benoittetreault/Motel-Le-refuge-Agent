@@ -32,6 +32,16 @@ The spoken confirmation is **code-generated and deterministic**, so the assistan
 say "I've texted you the link" unless an SMS was actually sent successfully. Web chat is
 untouched — all SMS logic lives in the voice route.
 
+**Log redaction (security follow-up).** Normal (always-on) logs never contain a complete guest
+number, the SMS body/booking URL, or Twilio credentials/auth. A reusable `maskPhone` helper
+(`lib/redact.ts`) renders `+15195551234` → `+1******1234`; it masks the per-turn "voice:
+incoming turn" log and `sms.ts`'s invalid-input path. On Twilio errors `sms.ts` logs only
+`status` + numeric `twilioCode` (not the raw body, which echoes the number); on a 2xx without a
+sid it logs field *names* only; on network/timeout it logs the error *name* only (never the raw
+error, whose URL carries the account SID). `VOICE_DEBUG_LOG` (opt-in, off by default) still
+exposes full numbers by design and must stay disabled in production — the always-on logs are
+already safe in code, not only by documentation.
+
 ## Files changed / why
 
 | File | Change |
@@ -39,11 +49,15 @@ untouched — all SMS logic lives in the voice route.
 | `routes/voice/booking-sms.ts` (new) | Orchestrator: dedup → verify → resolve number → send → decide spoken reply. Deps injected (testable without server/Reservit/Twilio). |
 | `routes/voice/sent-link-store.ts` (new) | Per-call, TTL-bounded in-memory dedup store. Length-prefixed composite key (no `(callId,key)` collisions). Factory + singleton. |
 | `routes/voice/concierge.ts` (mod) | Added `inviteToCallReply`, `smsSentReply` (bilingual, URL-free), `resolveGuestPhone` (metadata→DTMF). Refactored `toSpokenReply` to reuse `inviteToCallReply` (behavior identical). |
-| `routes/voice/index.ts` (mod) | Wired the link-bearing branch to `orchestrateBookingSms`; no-link branch unchanged. Secret-free outcome log. Header comment updated. |
+| `routes/voice/index.ts` (mod) | Wired the link-bearing branch to `orchestrateBookingSms`; no-link branch unchanged; secret-free outcome log; masked caller/dialed numbers in the per-turn log; strengthened `VOICE_DEBUG_LOG` production warning. |
 | `routes/voice/booking-sms.test.ts` (new) | 12 orchestrator cases (success, fail, no/invalid number, not-available, check_failed, dedup, retry-after-fail, multi-link, unparseable, no-callId, URL-never-spoken). |
 | `routes/voice/sent-link-store.test.ts` (new) | 5 dedup cases (mark/scope/TTL-expiry/refresh/no-forgery). |
 | `routes/voice/voice.test.ts` (mod) | +6 cases: `resolveGuestPhone` priority/fallback/null, `inviteToCallReply`/`smsSentReply` never leak URL/over-promise. |
-| `ARCHITECTURE.md` (mod) | §8 rewritten: Bloc B/C implemented, concierge-net approach, Twilio env vars. |
+| `lib/redact.ts` (new) | Reusable `maskPhone` helper (`+1******1234`), defensive on non-string/short input. |
+| `lib/redact.test.ts` (new) | 5 cases: E.164 masking, head/tail-only, short-value full mask, non-string/empty safety, never-throws. |
+| `lib/sms.ts` (mod) | Redacted all error logs: masked number on invalid-input; status+`twilioCode` (not body) on non-2xx; field-names-only on 2xx-no-sid; error-name-only on timeout/network. Send behavior unchanged. |
+| `lib/sms.test.ts` (mod) | +5 cases proving no complete number / body / URL / credentials / auth in any log; happy path logs nothing. |
+| `ARCHITECTURE.md` (mod) | §8 rewritten (Bloc B/C); §6.5 added (log redaction + debug-flag warning). |
 
 ## Architecture decisions
 
@@ -56,7 +70,7 @@ untouched — all SMS logic lives in the voice route.
 
 ## Tests executed & results (run from the worktree)
 
-- `pnpm --filter @workspace/api-server test` → **69 pass / 0 fail** (was 47 baseline pre-Bloc-B/C).
+- `pnpm --filter @workspace/api-server test` → **79 pass / 0 fail** (47 baseline + Bloc B/C + log-redaction tests).
 - `pnpm --filter @workspace/api-server typecheck` (after `npx tsc -b tsconfig.json`) → **exit 0**.
 - `node artifacts/api-server/build.mjs` (prod esbuild server bundle) → **exit 0**.
 - No lint step is configured in this repo.
