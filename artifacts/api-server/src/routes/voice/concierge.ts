@@ -135,23 +135,81 @@ export function extractKeypadPhone(messages: ChatMessageList): string | null {
   return null;
 }
 
-// The concierge net: turn the brain's candidate reply into something safe to
-// speak. If a booking link is present it is replaced wholesale with a bilingual
-// invitation to call (TODO Bloc B: a voice-specific prompt should avoid links at
-// the source). Any stray link and tool-syntax leakage is stripped regardless.
-export function toSpokenReply(
-  candidate: string,
-  opts: { phone: string; hours: string }
-): string {
+// ---- Spoken-reply text (bilingual, TTS-friendly) ----------------------------
+// A booking link must NEVER be spoken on the voice channel, so the reply the
+// guest hears in any link-bearing turn is one of these two code-authored
+// messages — never the model's prose and never a URL. Keeping them here (the
+// formatting layer) lets both the concierge net and the SMS orchestrator reuse
+// the exact same wording.
+
+export interface SpokenReplyOpts {
+  phone: string;
+  hours: string;
+}
+
+// Fallback whenever we will NOT (or could not) text the link: no guest number,
+// dates not available, Twilio failure, etc. It only ever invites the guest to
+// call — it must never claim an SMS was sent.
+export function inviteToCallReply(opts: SpokenReplyOpts): string {
+  return (
+    `Pour finaliser votre réservation, appelez-nous directement au ${opts.phone}, ` +
+    `pendant nos heures d'ouverture (${opts.hours}), et notre équipe s'occupera de tout. / ` +
+    `To finalize your booking, please call us directly at ${opts.phone} during our hours (${opts.hours}) and our team will take care of everything.`
+  );
+}
+
+// Spoken confirmation used ONLY after an SMS has been successfully sent (or was
+// already sent earlier this call). Deliberately contains no URL and no phone
+// number — nothing sensitive is read aloud, and it never over-promises beyond
+// "the link is on its way by text".
+export function smsSentReply(): string {
+  return (
+    "Parfait, je viens de vous envoyer le lien de réservation par texto — " +
+    "vous pouvez compléter votre réservation à partir de là. / " +
+    "Great, I've just sent you the booking link by text message — " +
+    "you can complete your reservation from there."
+  );
+}
+
+// The concierge net for turns WITHOUT SMS orchestration: turn the brain's
+// candidate reply into something safe to speak. If a booking link is present it
+// is replaced wholesale with the invite-to-call message (the SMS path in
+// booking-sms.ts handles the link-bearing turns that CAN text it). Any stray
+// link and tool-syntax leakage is stripped regardless.
+export function toSpokenReply(candidate: string, opts: SpokenReplyOpts): string {
   let reply = candidate;
   if (findAllReservitLinks(reply).length > 0) {
-    reply =
-      `Pour finaliser votre réservation, appelez-nous directement au ${opts.phone}, ` +
-      `pendant nos heures d'ouverture (${opts.hours}), et notre équipe s'occupera de tout. / ` +
-      `To finalize your booking, please call us directly at ${opts.phone} during our hours (${opts.hours}) and our team will take care of everything.`;
+    reply = inviteToCallReply(opts);
   }
   reply = reply.replace(RESERVIT_LINK_RE_G, "").replace(/[ \t]{2,}/g, " ").trim();
   return stripToolTags(reply).text;
+}
+
+// ---- Guest phone resolution (verified metadata first, then DTMF keypad) ------
+// E.164 shape check: a leading "+" followed by 8–15 digits (ITU max is 15).
+// Deliberately strict — we never guess or add a country code here (extractKeypad
+// already normalizes the keypad case), so a malformed metadata number falls
+// through to the keypad entry rather than being sent to Twilio as-is.
+const E164_RE = /^\+\d{8,15}$/;
+
+// Resolve the number to text the booking link to. Priority (per ARCHITECTURE
+// §8): the caller's own verified number from call metadata; failing that, the
+// DTMF keypad entry the guest typed (extractKeypadPhone). We deliberately do NOT
+// parse a spoken number out of the conversation — the intended fallback is the
+// Vapi keypad. Caveat: extractKeypadPhone judges a user message purely by its
+// digit count, so it cannot cryptographically distinguish a keypad injection
+// from a spoken number that happens to transcribe to exactly 10/11 clean digits
+// (a known, accepted limitation of the DTMF heuristic — see its own comment).
+// Returns E.164, or null if neither source yields a valid number — the caller
+// must then fall back to invite-to-call and must NOT claim an SMS was sent.
+export function resolveGuestPhone(
+  callerNumber: string | undefined,
+  messages: ChatMessageList
+): string | null {
+  if (typeof callerNumber === "string" && E164_RE.test(callerNumber)) {
+    return callerNumber;
+  }
+  return extractKeypadPhone(messages);
 }
 
 // ---- SSE response formatting (Vapi Custom LLM) --------------------------------

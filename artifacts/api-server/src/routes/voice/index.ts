@@ -3,6 +3,10 @@ import { randomUUID } from "node:crypto";
 import { getMotelConfig } from "@workspace/motel-config";
 import { generateReply } from "../anthropic/chat-brain";
 import { findAllReservitLinks } from "../anthropic/reservit-link";
+import { checkAvailability } from "../anthropic/availability";
+import { sendBookingLinkSms } from "../../lib/sms";
+import { orchestrateBookingSms } from "./booking-sms";
+import { sentLinkStore } from "./sent-link-store";
 import {
   mapVapiMessages,
   secretMatches,
@@ -15,7 +19,7 @@ import {
 } from "./concierge";
 
 // ============================================================================
-// Voice channel — Vapi.ai "Custom LLM" endpoint (Phase 2, Block A)
+// Voice channel — Vapi.ai "Custom LLM" endpoint (Phase 2, Blocks A + B/C)
 // ----------------------------------------------------------------------------
 // Vapi handles the telephony (ASR + TTS). Configured in "Custom LLM" mode, it
 // POSTs an OpenAI-compatible /chat/completions body to us on every turn, with
@@ -26,11 +30,15 @@ import {
 // runs to completion and the concierge net verifies the FULL text first; we only
 // wrap that finished, already-verified reply as SSE (see the response below).
 //
-// Concierge scope for Block A: the agent answers questions and checks
-// availability (check_availability runs normally, internally), but NEVER speaks
-// a booking link. If the (web) prompt still produces one, we replace the reply
-// with an invitation to call the motel. A voice-specific prompt comes in Block
-// B; SMS booking links come in Block C.
+// Concierge scope: the agent answers questions and checks availability
+// (check_availability runs internally). A booking link is NEVER spoken. When the
+// model produces one, orchestrateBookingSms (Bloc B/C) re-verifies availability,
+// resolves the guest's number (verified metadata → DTMF keypad), and TEXTS the
+// link via Twilio (deduped per call). Only after a successful send does the
+// assistant say "I've texted you the link"; on any failure it invites the guest
+// to call instead — it must never claim an SMS that did not go out. The shared
+// system prompt is intentionally left unchanged (no golden-snapshot change): all
+// link-safety and SMS behavior lives in this post-generation layer.
 // ============================================================================
 
 const router = Router();
@@ -111,13 +119,37 @@ const handleVoiceChat: import("express").RequestHandler = async (req, res) => {
     // never return tool_calls to it.
     const candidate = await generateReply(mapped);
 
-    // ---- Concierge net: a booking link must never be spoken ----
-    const reply = toSpokenReply(candidate, {
+    // ---- Concierge net + SMS orchestration (Bloc B/C) ----
+    // A booking link must never be SPOKEN. Two cases:
+    //   • No link  → speak the candidate as-is (tool-tags stripped by toSpokenReply).
+    //   • Link(s)  → hand off to orchestrateBookingSms, which re-verifies
+    //     availability, resolves the guest's number (verified metadata → DTMF),
+    //     texts the link via Twilio (deduped per call), and returns a SAFE
+    //     spoken reply: the "sent by text" confirmation ONLY after a successful
+    //     send, otherwise an invite-to-call. The URL is never spoken.
+    const spokenOpts = {
       phone: motel.identity.phone,
       hours: motel.hours.receptionLabel,
-    });
-    if (findAllReservitLinks(candidate).length > 0) {
-      req.log.info({ callId }, "voice: booking link present — replaced with invite-to-call");
+    };
+    const links = findAllReservitLinks(candidate);
+    let reply: string;
+    if (links.length === 0) {
+      reply = toSpokenReply(candidate, spokenOpts);
+    } else {
+      const outcome = await orchestrateBookingSms(
+        { links, callId, callerNumber, messages: mapped, motelName: motel.identity.name, spokenOpts },
+        {
+          checkAvailability,
+          sendSms: (to, smsBody) => sendBookingLinkSms(to, smsBody, req.log),
+          store: sentLinkStore,
+        }
+      );
+      reply = outcome.reply;
+      // Structured, secret-free outcome log (no number, no URL, no token).
+      req.log.info(
+        { callId, smsStatus: outcome.status, smsReason: outcome.smsReason },
+        "voice: booking-link SMS outcome"
+      );
     }
 
     if (process.env.VOICE_DEBUG_LOG === "true") {

@@ -186,17 +186,37 @@ Le header par défaut correspond à la config Vapi actuelle.
   l'import sans `ANTHROPIC_API_KEY` → toute logique testable (concierge, SSE, reservit-link)
   vit dans des modules purs importables sans clé (usage `import type` pour les types du cerveau).
 
-## 8. Plans en cours (non implémentés)
+## 8. Bloc B/C — lien de réservation par SMS (IMPLÉMENTÉ, non déployé)
 
-- **Bloc B — prompt vocal dédié.** Le Bloc A réutilise le prompt WEB tel quel (avec des
-  `TODO(Bloc B)`), d'où le filet `toSpokenReply` qui rattrape les liens *a posteriori*. Le
-  Bloc B doit : ne **jamais** produire de lien à la source, imposer des **phrases courtes**
-  (adaptées au TTS), et gérer le « First Message » de Vapi (message d'accueil).
-- **Bloc C — envoi du lien par SMS (via Twilio), planifié.** Après vérification de dispo
-  serveur, envoyer le lien Reservit par SMS plutôt que de le parler — en **réutilisant le
-  même point de détection** que le filet concierge actuel. **Capture du numéro** :
-  `call.customer.number` en priorité ; sinon saisie **clavier DTMF** via le `keypadInputPlan`
-  de Vapi. **JAMAIS de saisie vocale d'un numéro** (risque de transcription erronée).
+Livré ensemble (Bloc B et Bloc C ne peuvent PAS être déployés séparément : le Bloc B fait
+promettre l'envoi d'un SMS que seul le Bloc C réalise). Choix d'archi : **tout se joue dans
+la couche post-génération (« filet concierge »), le prompt partagé et son golden snapshot
+restent inchangés.** Le modèle produit toujours le lien Reservit dans son texte candidat ;
+c'est notre code, déterministe, qui décide de le texter et qui compose la confirmation
+parlée — donc l'assistant ne peut PAS dire « je vous ai envoyé le lien » sans envoi réussi.
+
+Flux (route voix, quand le candidat contient ≥ 1 lien) — `orchestrateBookingSms`
+(`routes/voice/booking-sms.ts`, deps injectées pour être testable sans serveur/Reservit/Twilio) :
+1. **Dédup d'abord** (`sent-link-store.ts`, map mémoire TTL 2 h, clé = `callId` + liens triés) :
+   Vapi rejoue tout l'historique à chaque tour ⇒ sans garde on texterait à chaque tour. Un
+   tour répété reparle la confirmation **sans** re-texter.
+2. **Re-vérif dispo serveur** : `parseReservitParams` → `checkAvailability` par lien ;
+   `check_failed` (Reservit injoignable) et lien non-parseable ne bloquent PAS (comme le web),
+   mais un `none_available/partial/too_long` bloque → invitation à appeler.
+3. **Numéro invité** (`resolveGuestPhone`) : `call.customer.number` (E.164) en priorité, sinon
+   `extractKeypadPhone` (saisie clavier DTMF). On ne parse **pas** volontairement un numéro
+   *dicté* — le fallback visé est le clavier Vapi. *Nuance* : `extractKeypadPhone` juge un
+   message user au seul nombre de chiffres, donc il ne peut pas distinguer une injection clavier
+   d'un numéro dicté qui se transcrit en exactement 10/11 chiffres propres (limite connue et
+   acceptée de l'heuristique DTMF). Aucun numéro ⇒ invitation à appeler.
+4. **Envoi** `sendBookingLinkSms` (Twilio, `lib/sms.ts`, ne throw jamais). Succès ⇒ `markSent`
+   + confirmation « envoyé par texto » (sans URL ni numéro parlé) ; échec ⇒ invitation à appeler.
+
+Env Twilio : `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, `TWILIO_FROM_NUMBER` (absents ⇒
+`not_configured` ⇒ fallback appel, jamais de fausse promesse). Le chat **web** est inchangé :
+toute la logique SMS vit dans la route voix. **Reste optionnel (nécessiterait golden + review
+Benoit)** : un prompt vocal dédié (phrases courtes TTS, lien-free à la source, First Message
+Vapi) — non requis pour la correction, l'approche concierge le rend superflu.
 
 ## 9. Limites connues & questions ouvertes
 

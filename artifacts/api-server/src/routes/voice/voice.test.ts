@@ -9,6 +9,9 @@ import {
   formatSsePayload,
   buildVoiceDebugInfo,
   extractKeypadPhone,
+  resolveGuestPhone,
+  inviteToCallReply,
+  smsSentReply,
 } from "./concierge";
 import type { ChatMessageList } from "../anthropic/chat-brain";
 
@@ -308,4 +311,44 @@ test("extractKeypadPhone: found by scanning backward past later user turns", () 
     { role: "user", content: "book it" },
   ];
   assert.equal(extractKeypadPhone(history), "+18195551234");
+});
+
+// ---- resolveGuestPhone (verified metadata first, then DTMF keypad) -----------
+
+test("resolveGuestPhone prefers a valid E.164 caller number from metadata", () => {
+  const history: ChatMessageList = [
+    { role: "user", content: "User's Keypad Entry: 8195551234" }, // present but must be ignored
+  ];
+  assert.equal(resolveGuestPhone("+15145550000", history), "+15145550000");
+});
+
+test("resolveGuestPhone falls back to the keypad when metadata is missing/invalid", () => {
+  const history: ChatMessageList = [
+    { role: "user", content: "User's Keypad Entry: 8195551234" },
+  ];
+  assert.equal(resolveGuestPhone(undefined, history), "+18195551234");
+  assert.equal(resolveGuestPhone("anonymous", history), "+18195551234");
+  assert.equal(resolveGuestPhone("+12", history), "+18195551234"); // too short → not E.164
+});
+
+test("resolveGuestPhone returns null when neither source yields a number", () => {
+  const history: ChatMessageList = [{ role: "user", content: "book it" }];
+  assert.equal(resolveGuestPhone(undefined, history), null);
+});
+
+// ---- Spoken reply helpers: never leak a URL, never over-promise -------------
+
+test("inviteToCallReply names the phone/hours and claims no SMS", () => {
+  const reply = inviteToCallReply(OPTS);
+  assert.match(reply, /819-564-9005/);
+  assert.match(reply, /appelez-nous|call us/);
+  assert.doesNotMatch(reply, /texto|text message/i);
+  assert.doesNotMatch(reply, /reservit\.com|https?:\/\//i);
+});
+
+test("smsSentReply confirms the text was sent, with no URL and no phone number", () => {
+  const reply = smsSentReply();
+  assert.match(reply, /texto|text message/i);
+  assert.doesNotMatch(reply, /reservit\.com|https?:\/\//i);
+  assert.doesNotMatch(reply, /819-564-9005/);
 });
