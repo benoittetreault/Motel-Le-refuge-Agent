@@ -82,6 +82,34 @@ test("toNumber without leading + -> invalid_input, no fetch attempted", async ()
   assert.equal(fetchCalls.length, 0);
 });
 
+test("strict E.164 rejects malformed numbers (no fetch attempted)", async () => {
+  setValidEnv();
+  for (const bad of [
+    "+", // just a plus
+    "+abc", // non-digits
+    "+0123456789", // leading zero country code
+    "+123", // too short (needs >= 8 digits total)
+    "+1234567", // 7 digits — still too short
+    "+1234567890123456", // 16 digits — too long (max 15)
+    "+1 519 555 1234", // spaces are not E.164
+    "+1-519-555-1234", // punctuation is not E.164
+  ]) {
+    const result = await sendBookingLinkSms(bad, "hi");
+    assert.deepEqual(result, { ok: false, reason: "invalid_input" }, `should reject ${JSON.stringify(bad)}`);
+  }
+  assert.equal(fetchCalls.length, 0, "no malformed number should reach Twilio");
+});
+
+test("strict E.164 accepts valid numbers (fetch attempted)", async () => {
+  setValidEnv();
+  fetchImpl = async () => jsonResponse(201, { sid: "SMok" });
+  for (const good of ["+15195551234", "+447911123456", "+3312345678"]) {
+    const result = await sendBookingLinkSms(good, "hi");
+    assert.equal(result.ok, true, `should accept ${good}`);
+  }
+  assert.equal(fetchCalls.length, 3);
+});
+
 test("successful send -> ok:true with the Twilio sid, correct request shape", async () => {
   setValidEnv();
   fetchImpl = async () => jsonResponse(201, { sid: "SM0123456789abcdef" });

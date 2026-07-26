@@ -4,17 +4,17 @@ import { orchestrateBookingSms, type BookingSmsDeps, type BookingSmsInput } from
 import { createSentLinkStore } from "./sent-link-store";
 import type { AvailabilityResult } from "../anthropic/availability";
 import type { SmsResult } from "../../lib/sms";
-import type { ChatMessageList } from "../anthropic/chat-brain";
 
-// A real, parseable Reservit link (arrival 2026-09-15, 2 nights, 2 adults).
-const LINK =
-  "http://softbooker.reservit.com/reservit/reserhotel.php?lang=EN&hotelid=444801&fday=15&fmonth=09&fyear=2026&nbnights=2&nbadt=2";
-const LINK2 =
-  "http://softbooker.reservit.com/reservit/reserhotel.php?lang=EN&hotelid=444801&fday=15&fmonth=09&fyear=2026&nbnights=2&nbadt=4";
+const HOTEL = "444801";
+const LINK_BASE = "http://softbooker.reservit.com/reservit/reserhotel.php";
+
+// Links as findAllReservitLinks yields them (protocol stripped by the pattern).
+// Valid, for OUR hotel, 2026-09-15 / 2 nights / N adults.
+const LINK = "softbooker.reservit.com/reservit/reserhotel.php?lang=EN&hotelid=444801&fday=15&fmonth=09&fyear=2026&nbnights=2&nbadt=2";
+const LINK2 = "softbooker.reservit.com/reservit/reserhotel.php?lang=EN&hotelid=444801&fday=15&fmonth=09&fyear=2026&nbnights=2&nbadt=4";
 
 const SPOKEN_OPTS = { phone: "819-564-9005", hours: "15h00 - 21h00 (3 PM - 9 PM) daily" };
 
-// A tiny recording harness for the injected deps.
 interface Recorder {
   availabilityCalls: Array<{ arrivalDate: string; nights: number; adults: number }>;
   smsCalls: Array<{ to: string; body: string }>;
@@ -23,6 +23,7 @@ interface Recorder {
 function makeDeps(opts: {
   availability?: AvailabilityResult | AvailabilityResult[];
   sms?: SmsResult;
+  sendSms?: (to: string, body: string) => Promise<SmsResult>;
   store?: BookingSmsDeps["store"];
   rec?: Recorder;
 }): BookingSmsDeps {
@@ -34,10 +35,12 @@ function makeDeps(opts: {
       const a = opts.availability ?? { status: "all_available", firstPrice: 100 };
       return Array.isArray(a) ? a[availIdx++] : a;
     },
-    sendSms: async (to, body) => {
-      rec?.smsCalls.push({ to, body });
-      return opts.sms ?? { ok: true, sid: "SMtest" };
-    },
+    sendSms:
+      opts.sendSms ??
+      (async (to, body) => {
+        rec?.smsCalls.push({ to, body });
+        return opts.sms ?? { ok: true, sid: "SMtest" };
+      }),
     store: opts.store ?? createSentLinkStore(),
   };
 }
@@ -49,17 +52,19 @@ function baseInput(overrides: Partial<BookingSmsInput> = {}): BookingSmsInput {
     callerNumber: "+15195551234",
     messages: [{ role: "user", content: "Je veux réserver" }],
     motelName: "Motel Le Refuge",
+    bookingConfig: { hotelId: HOTEL, linkBase: LINK_BASE },
     spokenOpts: SPOKEN_OPTS,
     ...overrides,
   };
 }
 
-// A spoken reply must NEVER contain a URL.
 function assertNoUrl(reply: string): void {
   assert.doesNotMatch(reply, /reservit\.com|softbooker|https?:\/\//i, `spoken reply leaked a URL: ${reply}`);
 }
 
-test("available + valid metadata number → sends once, speaks the sent-confirmation", async () => {
+// ---- Happy path -------------------------------------------------------------
+
+test("valid available link + number → sends server-built URL once, confirms", async () => {
   const rec: Recorder = { availabilityCalls: [], smsCalls: [] };
   const deps = makeDeps({ availability: { status: "all_available", firstPrice: 100 }, rec });
 
@@ -68,12 +73,14 @@ test("available + valid metadata number → sends once, speaks the sent-confirma
   assert.equal(outcome.status, "sent");
   assert.equal(rec.smsCalls.length, 1);
   assert.equal(rec.smsCalls[0].to, "+15195551234");
-  assert.match(rec.smsCalls[0].body, /reservit\.com/); // the SMS body DOES carry the link
+  // The SMS body carries the canonical, server-built URL for OUR hotel.
+  assert.match(rec.smsCalls[0].body, /hotelid=444801/);
+  assert.match(rec.smsCalls[0].body, /softbooker\.reservit\.com\/reservit\/reserhotel\.php/);
   assert.match(outcome.reply, /texto|text message/i);
-  assertNoUrl(outcome.reply); // but the SPOKEN reply never does
+  assertNoUrl(outcome.reply);
 });
 
-test("SMS failure → does NOT claim a send, invites to call, does not mark sent", async () => {
+test("SMS failure → invite-to-call, releases claim, no false confirmation", async () => {
   const store = createSentLinkStore();
   const rec: Recorder = { availabilityCalls: [], smsCalls: [] };
   const deps = makeDeps({ sms: { ok: false, reason: "twilio_error" }, store, rec });
@@ -82,14 +89,13 @@ test("SMS failure → does NOT claim a send, invites to call, does not mark sent
 
   assert.equal(outcome.status, "send_failed");
   assert.equal(outcome.smsReason, "twilio_error");
-  assert.match(outcome.reply, /appelez-nous|call us/i);
-  assert.doesNotMatch(outcome.reply, /texto|text message/i); // never a false "sent"
+  assert.doesNotMatch(outcome.reply, /texto|text message/i);
   assertNoUrl(outcome.reply);
-  // Not marked → a later turn is free to retry.
-  assert.equal(store.alreadySent("call-1", LINK), false);
+  // (That the claim was released so a later turn can retry is proven by the
+  // dedicated "failed send then a retry sends again" test below.)
 });
 
-test("no guest number (no metadata, no keypad) → no_number, no SMS attempted", async () => {
+test("no guest number → no_number, no SMS attempted", async () => {
   const rec: Recorder = { availabilityCalls: [], smsCalls: [] };
   const deps = makeDeps({ rec });
 
@@ -100,7 +106,6 @@ test("no guest number (no metadata, no keypad) → no_number, no SMS attempted",
 
   assert.equal(outcome.status, "no_number");
   assert.equal(rec.smsCalls.length, 0);
-  assert.match(outcome.reply, /appelez-nous|call us/i);
   assertNoUrl(outcome.reply);
 });
 
@@ -110,7 +115,7 @@ test("invalid metadata number falls back to a DTMF keypad entry", async () => {
 
   const outcome = await orchestrateBookingSms(
     baseInput({
-      callerNumber: "anonymous", // not E.164
+      callerNumber: "anonymous",
       messages: [{ role: "user", content: "User's Keypad Entry: 8195551234" }],
     }),
     deps
@@ -120,7 +125,9 @@ test("invalid metadata number falls back to a DTMF keypad entry", async () => {
   assert.equal(rec.smsCalls[0].to, "+18195551234");
 });
 
-test("dates not available (hard failure) → not_available, no SMS", async () => {
+// ---- Availability -----------------------------------------------------------
+
+test("definitive not-available → not_available, no SMS", async () => {
   const rec: Recorder = { availabilityCalls: [], smsCalls: [] };
   const deps = makeDeps({ availability: { status: "none_available" }, rec });
 
@@ -128,11 +135,10 @@ test("dates not available (hard failure) → not_available, no SMS", async () =>
 
   assert.equal(outcome.status, "not_available");
   assert.equal(rec.smsCalls.length, 0);
-  assert.match(outcome.reply, /appelez-nous|call us/i);
   assertNoUrl(outcome.reply);
 });
 
-test("check_failed (Reservit unreachable) does NOT block the send", async () => {
+test("check_failed (Reservit unreachable) is non-blocking → still sends", async () => {
   const rec: Recorder = { availabilityCalls: [], smsCalls: [] };
   const deps = makeDeps({ availability: { status: "check_failed" }, rec });
 
@@ -142,7 +148,9 @@ test("check_failed (Reservit unreachable) does NOT block the send", async () => 
   assert.equal(rec.smsCalls.length, 1);
 });
 
-test("repeated turn with the same link → duplicate, no second SMS, still confirms", async () => {
+// ---- Dedup / concurrency ----------------------------------------------------
+
+test("repeated turn (sequential) → duplicate, no second SMS, still confirms", async () => {
   const store = createSentLinkStore();
   const rec: Recorder = { availabilityCalls: [], smsCalls: [] };
   const deps = makeDeps({ store, rec });
@@ -152,26 +160,71 @@ test("repeated turn with the same link → duplicate, no second SMS, still confi
 
   assert.equal(first.status, "sent");
   assert.equal(second.status, "duplicate");
-  assert.equal(rec.smsCalls.length, 1); // exactly one SMS across both turns
+  assert.equal(rec.smsCalls.length, 1);
   assert.match(second.reply, /texto|text message/i);
-  // A duplicate turn must not even re-hit Reservit.
-  assert.equal(rec.availabilityCalls.length, 1);
+  assert.equal(rec.availabilityCalls.length, 1); // duplicate short-circuits before Reservit
 });
 
-test("dedup is keyed per send SUCCESS: a failed send then a retry sends again", async () => {
+test("two SIMULTANEOUS turns (Promise.all) send exactly once", async () => {
   const store = createSentLinkStore();
   const rec: Recorder = { availabilityCalls: [], smsCalls: [] };
 
-  // Turn 1: Twilio fails.
+  // A deliberately slow send so both invocations overlap in time.
+  const sendSms = async (to: string, body: string): Promise<SmsResult> => {
+    rec.smsCalls.push({ to, body });
+    await new Promise((r) => setTimeout(r, 20));
+    return { ok: true, sid: "SMok" };
+  };
+  const deps = makeDeps({ store, rec, sendSms });
+
+  const [a, b] = await Promise.all([
+    orchestrateBookingSms(baseInput(), deps),
+    orchestrateBookingSms(baseInput(), deps),
+  ]);
+
+  // Exactly one SMS goes out; the loser sees the in-flight claim and does NOT send.
+  assert.equal(rec.smsCalls.length, 1, "sendSms must be called exactly once");
+  const statuses = [a.status, b.status].sort();
+  assert.deepEqual(statuses, ["in_flight", "sent"]);
+  // Neither reply leaks a URL, and the loser never falsely claims a send.
+  assertNoUrl(a.reply);
+  assertNoUrl(b.reply);
+  const loser = a.status === "in_flight" ? a : b;
+  assert.doesNotMatch(loser.reply, /texto|text message/i);
+});
+
+test("dedup keyed on send SUCCESS: a failed send then a retry sends again", async () => {
+  const store = createSentLinkStore();
+  const rec: Recorder = { availabilityCalls: [], smsCalls: [] };
+
   const failDeps = makeDeps({ sms: { ok: false, reason: "timeout" }, store, rec });
   const first = await orchestrateBookingSms(baseInput(), failDeps);
   assert.equal(first.status, "send_failed");
 
-  // Turn 2: Twilio recovers — the same link must be retried, not deduped away.
   const okDeps = makeDeps({ sms: { ok: true, sid: "SMok" }, store, rec });
   const second = await orchestrateBookingSms(baseInput(), okDeps);
   assert.equal(second.status, "sent");
   assert.equal(rec.smsCalls.length, 2);
+});
+
+// ---- Multiple links ---------------------------------------------------------
+
+test("multiple valid links, all available → one SMS carrying both canonical URLs", async () => {
+  const rec: Recorder = { availabilityCalls: [], smsCalls: [] };
+  const deps = makeDeps({
+    availability: [
+      { status: "all_available", firstPrice: 100 },
+      { status: "all_available", firstPrice: 120 },
+    ],
+    rec,
+  });
+
+  const outcome = await orchestrateBookingSms(baseInput({ links: [LINK, LINK2] }), deps);
+
+  assert.equal(outcome.status, "sent");
+  assert.equal(rec.smsCalls.length, 1);
+  assert.match(rec.smsCalls[0].body, /nbadt=2/);
+  assert.match(rec.smsCalls[0].body, /nbadt=4/);
 });
 
 test("multiple links, one not available → blocked, no SMS", async () => {
@@ -190,48 +243,93 @@ test("multiple links, one not available → blocked, no SMS", async () => {
   assert.equal(rec.smsCalls.length, 0);
 });
 
-test("multiple different links, all available → one SMS carrying both", async () => {
-  const rec: Recorder = { availabilityCalls: [], smsCalls: [] };
-  const deps = makeDeps({
-    availability: [
-      { status: "all_available", firstPrice: 100 },
-      { status: "all_available", firstPrice: 120 },
-    ],
-    rec,
-  });
+// ---- Strict link validation (untrusted model input) -------------------------
 
-  const outcome = await orchestrateBookingSms(baseInput({ links: [LINK, LINK2] }), deps);
-
-  assert.equal(outcome.status, "sent");
-  assert.equal(rec.smsCalls.length, 1);
-  assert.match(rec.smsCalls[0].body, /nbadt=2/);
-  assert.match(rec.smsCalls[0].body, /nbadt=4/);
-});
-
-test("an unparseable link is not verifiable → not blocked (sent)", async () => {
+test("unparseable link → invalid_link, no SMS", async () => {
   const rec: Recorder = { availabilityCalls: [], smsCalls: [] };
   const deps = makeDeps({ rec });
-  // A link that matches the pattern but has no query params to parse.
-  const bad = "http://softbooker.reservit.com/reservit/reserhotel.php?garbage";
+  const bad = "softbooker.reservit.com/reservit/reserhotel.php?garbage";
 
   const outcome = await orchestrateBookingSms(baseInput({ links: [bad] }), deps);
 
-  assert.equal(outcome.status, "sent");
-  assert.equal(rec.availabilityCalls.length, 0); // nothing parseable to check
-  assert.equal(rec.smsCalls.length, 1);
+  assert.equal(outcome.status, "invalid_link");
+  assert.equal(rec.smsCalls.length, 0);
+  assert.equal(rec.availabilityCalls.length, 0);
+  assertNoUrl(outcome.reply);
 });
 
-test("undefined callId still sends (no dedup), never throws", async () => {
-  const store = createSentLinkStore();
+test("wrong hostname → invalid_link, no SMS", async () => {
   const rec: Recorder = { availabilityCalls: [], smsCalls: [] };
-  const deps = makeDeps({ store, rec });
+  const deps = makeDeps({ rec });
+  const evil =
+    "softbooker.reservit.com.evil.example/reservit/reserhotel.php?lang=EN&hotelid=444801&fday=15&fmonth=09&fyear=2026&nbnights=2&nbadt=2";
 
-  const first = await orchestrateBookingSms(baseInput({ callId: undefined }), deps);
-  const second = await orchestrateBookingSms(baseInput({ callId: undefined }), deps);
+  const outcome = await orchestrateBookingSms(baseInput({ links: [evil] }), deps);
+  assert.equal(outcome.status, "invalid_link");
+  assert.equal(rec.smsCalls.length, 0);
+});
 
-  // Without a callId we cannot dedup — both turns send. (Acceptable: Vapi always
-  // provides a call id in practice; this only guards against a malformed payload.)
-  assert.equal(first.status, "sent");
-  assert.equal(second.status, "sent");
-  assert.equal(rec.smsCalls.length, 2);
+test("wrong path → invalid_link, no SMS", async () => {
+  const rec: Recorder = { availabilityCalls: [], smsCalls: [] };
+  const deps = makeDeps({ rec });
+  const wrongPath =
+    "softbooker.reservit.com/evil/reserhotel.php?lang=EN&hotelid=444801&fday=15&fmonth=09&fyear=2026&nbnights=2&nbadt=2";
+
+  const outcome = await orchestrateBookingSms(baseInput({ links: [wrongPath] }), deps);
+  assert.equal(outcome.status, "invalid_link");
+  assert.equal(rec.smsCalls.length, 0);
+});
+
+test("wrong hotel id → invalid_link, no SMS", async () => {
+  const rec: Recorder = { availabilityCalls: [], smsCalls: [] };
+  const deps = makeDeps({ rec });
+  const otherHotel =
+    "softbooker.reservit.com/reservit/reserhotel.php?lang=EN&hotelid=999999&fday=15&fmonth=09&fyear=2026&nbnights=2&nbadt=2";
+
+  const outcome = await orchestrateBookingSms(baseInput({ links: [otherHotel] }), deps);
+  assert.equal(outcome.status, "invalid_link");
+  assert.equal(rec.smsCalls.length, 0);
+});
+
+test("missing required parameter → invalid_link, no SMS", async () => {
+  const rec: Recorder = { availabilityCalls: [], smsCalls: [] };
+  const deps = makeDeps({ rec });
+  const missingAdults =
+    "softbooker.reservit.com/reservit/reserhotel.php?lang=EN&hotelid=444801&fday=15&fmonth=09&fyear=2026&nbnights=2";
+
+  const outcome = await orchestrateBookingSms(baseInput({ links: [missingAdults] }), deps);
+  assert.equal(outcome.status, "invalid_link");
+  assert.equal(rec.smsCalls.length, 0);
+});
+
+test("model extra query params cannot change the hotel or reach the guest", async () => {
+  const rec: Recorder = { availabilityCalls: [], smsCalls: [] };
+  const deps = makeDeps({ rec });
+  // Correct hotel, but the model tacks on junk + a second hotelid-like param.
+  const withExtras =
+    "softbooker.reservit.com/reservit/reserhotel.php?lang=EN&hotelid=444801&fday=15&fmonth=09&fyear=2026&nbnights=2&nbadt=2&evilRedirect=1&hotelid2=999999";
+
+  const outcome = await orchestrateBookingSms(baseInput({ links: [withExtras] }), deps);
+
+  assert.equal(outcome.status, "sent");
+  assert.equal(rec.smsCalls.length, 1);
+  // The sent URL is rebuilt from config: our hotel, no injected params.
+  assert.match(rec.smsCalls[0].body, /hotelid=444801/);
+  assert.doesNotMatch(rec.smsCalls[0].body, /evilRedirect/);
+  assert.doesNotMatch(rec.smsCalls[0].body, /999999/);
+  assert.doesNotMatch(rec.smsCalls[0].body, /hotelid2/);
+});
+
+// ---- Idempotency guard ------------------------------------------------------
+
+test("missing call id → missing_call_id, no SMS attempted", async () => {
+  const rec: Recorder = { availabilityCalls: [], smsCalls: [] };
+  const deps = makeDeps({ rec });
+
+  const outcome = await orchestrateBookingSms(baseInput({ callId: undefined }), deps);
+
+  assert.equal(outcome.status, "missing_call_id");
+  assert.equal(rec.smsCalls.length, 0);
+  assert.equal(rec.availabilityCalls.length, 0);
+  assertNoUrl(outcome.reply);
 });

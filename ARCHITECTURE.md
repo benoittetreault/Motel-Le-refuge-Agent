@@ -219,20 +219,36 @@ parlée — donc l'assistant ne peut PAS dire « je vous ai envoyé le lien » s
 
 Flux (route voix, quand le candidat contient ≥ 1 lien) — `orchestrateBookingSms`
 (`routes/voice/booking-sms.ts`, deps injectées pour être testable sans serveur/Reservit/Twilio) :
-1. **Dédup d'abord** (`sent-link-store.ts`, map mémoire TTL 2 h, clé = `callId` + liens triés) :
-   Vapi rejoue tout l'historique à chaque tour ⇒ sans garde on texterait à chaque tour. Un
-   tour répété reparle la confirmation **sans** re-texter.
-2. **Re-vérif dispo serveur** : `parseReservitParams` → `checkAvailability` par lien ;
-   `check_failed` (Reservit injoignable) et lien non-parseable ne bloquent PAS (comme le web),
-   mais un `none_available/partial/too_long` bloque → invitation à appeler.
-3. **Numéro invité** (`resolveGuestPhone`) : `call.customer.number` (E.164) en priorité, sinon
-   `extractKeypadPhone` (saisie clavier DTMF). On ne parse **pas** volontairement un numéro
-   *dicté* — le fallback visé est le clavier Vapi. *Nuance* : `extractKeypadPhone` juge un
-   message user au seul nombre de chiffres, donc il ne peut pas distinguer une injection clavier
-   d'un numéro dicté qui se transcrit en exactement 10/11 chiffres propres (limite connue et
-   acceptée de l'heuristique DTMF). Aucun numéro ⇒ invitation à appeler.
-4. **Envoi** `sendBookingLinkSms` (Twilio, `lib/sms.ts`, ne throw jamais). Succès ⇒ `markSent`
-   + confirmation « envoyé par texto » (sans URL ni numéro parlé) ; échec ⇒ invitation à appeler.
+0. **`callId` obligatoire** : sans identifiant d'appel stable, pas de clé d'idempotence ⇒ on
+   n'envoie PAS (statut `missing_call_id`, invitation à appeler).
+1. **Validation stricte + reconstruction serveur** du lien (le lien du modèle est une entrée
+   **non fiable**) : `parseAndValidateReservitLink` vérifie hôte exact (`softbooker.reservit.com`),
+   chemin exact (`/reservit/reserhotel.php`), `hotelid` == config, et fday/fmonth/fyear/nbnights/
+   nbadt présents + numériques + plages valides + date réelle. **On jette l'URL du modèle** et on
+   reconstruit l'URL canonique via `buildReservitLink(config.linkBase, config.hotelId, …)`. Ainsi
+   un `hotelid` falsifié, un paramètre injecté ou un hôte sosie ne peut JAMAIS rediriger. Tout
+   lien invalide ⇒ `invalid_link`, aucun SMS.
+2. **Claim atomique** (`sent-link-store.ts`, machine à états par `(callId, clé)` : not-claimed →
+   in-flight → sent ; clé = `JSON.stringify` des URLs canoniques triées, anti-collision). `claim`
+   est **synchrone donc atomique** : deux tours concurrents ⇒ un seul obtient `claimed`, l'autre
+   voit `in_flight` et **n'envoie pas**. `already_sent` (tour ultérieur) ⇒ reparle la confirmation
+   sans re-texter. TTL 2 h ; l'in-flight expire aussi (anti-blocage si crash en plein envoi).
+3. **Re-vérif dispo serveur** (paramètres validés) : `checkAvailability` par booking ; `check_failed`
+   (Reservit injoignable) **ne bloque pas** — on ne prétend jamais « vérifié » quand Reservit est
+   injoignable —, mais `none_available/partial/too_long` bloque (release + invitation à appeler).
+4. **Numéro invité** (`resolveGuestPhone`) : `call.customer.number` (E.164 strict) en priorité,
+   sinon `extractKeypadPhone` (clavier DTMF). Jamais un numéro *dicté* volontairement. Aucun
+   numéro ⇒ release + invitation.
+5. **Envoi** `sendBookingLinkSms` (Twilio, `lib/sms.ts`, E.164 strict `/^\+[1-9]\d{7,14}$/`, ne
+   throw jamais). Succès ⇒ `markSent` + confirmation « envoyé par texto » (sans URL ni numéro
+   parlé). Échec ⇒ `release` (retry possible plus tard) + invitation. **Jamais** de fausse
+   promesse d'envoi.
+
+**Idempotence — 1 seul process.** `sent-link-store` vit en mémoire d'UN process Node : protège
+les tours concurrents/dupliqués **d'une même instance**, PAS entre instances. `railway.json` ne
+déclare aucune réplique et Railway défaut = **1 instance**, donc suffisant aujourd'hui ; mais
+**non vérifié** sur le dashboard live. Passer à > 1 réplique **casserait** l'idempotence — il
+faudrait alors un store partagé (Redis) ou une contrainte d'unicité en base.
 
 Env Twilio : `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, `TWILIO_FROM_NUMBER` (absents ⇒
 `not_configured` ⇒ fallback appel, jamais de fausse promesse). Le chat **web** est inchangé :

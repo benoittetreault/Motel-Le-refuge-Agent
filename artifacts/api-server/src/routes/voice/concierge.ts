@@ -186,11 +186,12 @@ export function toSpokenReply(candidate: string, opts: SpokenReplyOpts): string 
 }
 
 // ---- Guest phone resolution (verified metadata first, then DTMF keypad) ------
-// E.164 shape check: a leading "+" followed by 8–15 digits (ITU max is 15).
-// Deliberately strict — we never guess or add a country code here (extractKeypad
-// already normalizes the keypad case), so a malformed metadata number falls
-// through to the keypad entry rather than being sent to Twilio as-is.
-const E164_RE = /^\+\d{8,15}$/;
+// Strict E.164: "+", a leading non-zero country-code digit, then 7–14 more
+// digits (8–15 total, the ITU maximum). Deliberately strict — we never guess or
+// add a country code here (extractKeypadPhone already normalizes the keypad
+// case), so a malformed metadata number falls through to the keypad entry rather
+// than being sent to Twilio as-is. Mirrors the provider-boundary check in sms.ts.
+const E164_RE = /^\+[1-9]\d{7,14}$/;
 
 // Resolve the number to text the booking link to. Priority (per ARCHITECTURE
 // §8): the caller's own verified number from call metadata; failing that, the
@@ -210,6 +211,18 @@ export function resolveGuestPhone(
     return callerNumber;
   }
   return extractKeypadPhone(messages);
+}
+
+// ---- VOICE_DEBUG_LOG gating --------------------------------------------------
+// The opt-in debug block logs COMPLETE phone numbers and raw message text, so it
+// must never run in production even if the flag is accidentally left on. Enabled
+// only when the flag is exactly "true" AND we are not in production. Pure so the
+// gate is unit-tested without touching the route.
+export function voiceDebugEnabled(
+  flag: string | undefined,
+  nodeEnv: string | undefined
+): boolean {
+  return flag === "true" && nodeEnv !== "production";
 }
 
 // ---- SSE response formatting (Vapi Custom LLM) --------------------------------

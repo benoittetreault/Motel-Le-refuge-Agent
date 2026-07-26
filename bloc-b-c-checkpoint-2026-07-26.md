@@ -46,18 +46,30 @@ already safe in code, not only by documentation.
 
 | File | Change |
 |------|--------|
-| `routes/voice/booking-sms.ts` (new) | Orchestrator: dedup → verify → resolve number → send → decide spoken reply. Deps injected (testable without server/Reservit/Twilio). |
-| `routes/voice/sent-link-store.ts` (new) | Per-call, TTL-bounded in-memory dedup store. Length-prefixed composite key (no `(callId,key)` collisions). Factory + singleton. |
-| `routes/voice/concierge.ts` (mod) | Added `inviteToCallReply`, `smsSentReply` (bilingual, URL-free), `resolveGuestPhone` (metadata→DTMF). Refactored `toSpokenReply` to reuse `inviteToCallReply` (behavior identical). |
-| `routes/voice/index.ts` (mod) | Wired the link-bearing branch to `orchestrateBookingSms`; no-link branch unchanged; secret-free outcome log; masked caller/dialed numbers in the per-turn log; strengthened `VOICE_DEBUG_LOG` production warning. |
-| `routes/voice/booking-sms.test.ts` (new) | 12 orchestrator cases (success, fail, no/invalid number, not-available, check_failed, dedup, retry-after-fail, multi-link, unparseable, no-callId, URL-never-spoken). |
-| `routes/voice/sent-link-store.test.ts` (new) | 5 dedup cases (mark/scope/TTL-expiry/refresh/no-forgery). |
-| `routes/voice/voice.test.ts` (mod) | +6 cases: `resolveGuestPhone` priority/fallback/null, `inviteToCallReply`/`smsSentReply` never leak URL/over-promise. |
+| `routes/anthropic/reservit-link.ts` (mod) | Added `parseAndValidateReservitLink` (strict host/path/hotelid/param/date validation) + `buildReservitLink` (server-side canonical URL from config). `parseReservitParams` unchanged (web route). |
+| `routes/anthropic/reservit-link.test.ts` (mod) | +8 validation cases (valid, scheme-optional, wrong host/path/hotel, missing/non-numeric/out-of-range/impossible-date, extra params ignored, canonical build). |
+| `routes/voice/booking-sms.ts` (new) | Orchestrator: require callId → validate+rebuild links server-side → atomic claim → verify → resolve number → send → release/markSent. Deps injected. |
+| `routes/voice/sent-link-store.ts` (new) | Concurrency-safe atomic claim store (not-claimed → in-flight → sent), `claim`/`markSent`/`release`, TTL, length-prefixed key. Single-process. |
+| `routes/voice/concierge.ts` (mod) | Added `inviteToCallReply`, `smsSentReply` (URL-free), `resolveGuestPhone` (metadata→DTMF, strict E.164), `voiceDebugEnabled` (prod-gated). `toSpokenReply` refactored, behavior identical. |
+| `routes/voice/index.ts` (mod) | Wired orchestrator (passes `bookingConfig`); masked caller/dialed numbers in the per-turn log; both `VOICE_DEBUG_LOG` blocks gated by `voiceDebugEnabled`. |
+| `routes/voice/booking-sms.test.ts` (new) | 20 cases incl. server-side validation (unparseable/wrong host/path/hotel/missing param/extra-params-ignored), concurrency (`Promise.all` → one send), missing-callId, dedup/retry, URL-never-spoken. |
+| `routes/voice/sent-link-store.test.ts` (mod) | 8 cases: claim/in-flight/already-sent, release retryable, release-never-unsends, scope, TTL (in-flight + sent), refresh, no-forgery. |
+| `routes/voice/voice.test.ts` (mod) | +`resolveGuestPhone` and spoken-helper cases; +`voiceDebugEnabled` prod-gating cases. |
 | `lib/redact.ts` (new) | Reusable `maskPhone` helper (`+1******1234`), defensive on non-string/short input. |
 | `lib/redact.test.ts` (new) | 5 cases: E.164 masking, head/tail-only, short-value full mask, non-string/empty safety, never-throws. |
-| `lib/sms.ts` (mod) | Redacted all error logs: masked number on invalid-input; status+`twilioCode` (not body) on non-2xx; field-names-only on 2xx-no-sid; error-name-only on timeout/network. Send behavior unchanged. |
-| `lib/sms.test.ts` (mod) | +5 cases proving no complete number / body / URL / credentials / auth in any log; happy path logs nothing. |
-| `ARCHITECTURE.md` (mod) | §8 rewritten (Bloc B/C); §6.5 added (log redaction + debug-flag warning). |
+| `lib/sms.ts` (mod) | Strict E.164 boundary. Redacted all error logs: masked number on invalid-input; status+`twilioCode` (not body) on non-2xx; field-names-only on 2xx-no-sid; error-name-only on timeout/network. Send behavior unchanged. |
+| `lib/sms.test.ts` (mod) | +log-redaction cases and +strict-E.164 accept/reject cases. |
+| `ARCHITECTURE.md` (mod) | §8 rewritten (hardened flow, single-process idempotency, Railway note); §6.5 (log redaction + debug-flag warning). |
+
+## PR #27 hardening (pre-merge blocking review)
+
+- **Concurrency-safe dedup.** `sent-link-store` is now an atomic state machine per `(callId, key)`: not-claimed → in-flight → sent, with `claim`/`markSent`/`release`. `claim` runs synchronously before any `await`, so two simultaneous turns cannot both send (one gets `claimed`, the other `in_flight`); a failed send `release`s for retry. Proven by a `Promise.all` test asserting `sendSms` fires exactly once. **Single process only** — no cross-instance idempotency (see limitations).
+- **Server-side link construction.** Model links are untrusted: `parseAndValidateReservitLink` enforces exact host, exact path, config `hotelid`, and valid/in-range/real-date params; the URL is then rebuilt from config via `buildReservitLink`. A wrong host/path/hotel or an injected query param can never reach the guest or redirect. Any invalid link → no SMS, invite-to-call.
+- **Idempotency requires a call id.** A link-bearing turn with no `callId` → no SMS, invite-to-call, log reason `missing_call_id`.
+- **Strict E.164** at the provider boundary (`/^\+[1-9]\d{7,14}$/`) and in the resolver.
+- **Collision-proof dedup key** via `JSON.stringify` of the sorted canonical URLs (no delimiter forgery).
+- **`VOICE_DEBUG_LOG` blocked in production** via `voiceDebugEnabled` (flag must be `"true"` AND `NODE_ENV !== "production"`), so an accidentally-on flag cannot leak PII in prod.
+- **`check_failed` is never called "verified."** Reservit-unreachable is non-blocking but explicitly not a verification claim.
 
 ## Architecture decisions
 
@@ -70,7 +82,7 @@ already safe in code, not only by documentation.
 
 ## Tests executed & results (run from the worktree)
 
-- `pnpm --filter @workspace/api-server test` → **79 pass / 0 fail** (47 baseline + Bloc B/C + log-redaction tests).
+- `pnpm --filter @workspace/api-server test` → **99 pass / 0 fail** (Bloc B/C + log-redaction + PR-27 hardening).
 - `pnpm --filter @workspace/api-server typecheck` (after `npx tsc -b tsconfig.json`) → **exit 0**.
 - `node artifacts/api-server/build.mjs` (prod esbuild server bundle) → **exit 0**.
 - No lint step is configured in this repo.
@@ -88,7 +100,12 @@ already safe in code, not only by documentation.
   be rejected. Metadata is preferred; this only affects the keypad fallback. Not changed here
   (separate merged feature); tighten separately if the live keypad format allows a hard marker.
 - SMS body language is fixed bilingual FR/EN (not per-guest-language).
-- Dedup does not survive a process restart mid-call (acceptable: worst case one duplicate SMS).
+- **Dedup is single-process, in-memory.** It prevents duplicate/concurrent sends within one Node
+  instance only — it gives NO cross-instance idempotency. `railway.json` declares no replicas and
+  Railway defaults to 1 instance, so this is sufficient today, but that is the repo default and has
+  **not been verified against the live Railway dashboard**. Running >1 replica would allow one SMS
+  per instance; cross-instance safety would need a shared store (Redis) or a DB uniqueness
+  constraint. Dedup also does not survive a process restart mid-call (worst case: one duplicate SMS).
 - Availability is re-checked every non-duplicate link turn (extra Reservit latency), consistent
   with the web route.
 - Requires `TWILIO_ACCOUNT_SID` / `TWILIO_AUTH_TOKEN` / `TWILIO_FROM_NUMBER` in prod; absent →

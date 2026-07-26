@@ -60,9 +60,12 @@ export async function sendBookingLinkSms(
     return { ok: false, reason: "not_configured" };
   }
 
-  // 2. Validate the destination. Must be E.164 (starts with "+"); we never guess
-  // or add a country code — reject cleanly and let the caller fall back.
-  if (typeof toNumber !== "string" || !toNumber.startsWith("+")) {
+  // 2. Validate the destination as strict E.164: "+", a leading non-zero
+  // country-code digit, then 7–14 more digits (8–15 total, the ITU maximum). We
+  // never guess or add a country code — reject cleanly and let the caller fall
+  // back. This is the provider boundary, so the check is authoritative here even
+  // though callers pre-validate.
+  if (typeof toNumber !== "string" || !/^\+[1-9]\d{7,14}$/.test(toNumber)) {
     // Log a MASKED form only — never the complete destination number.
     warn(logger, { toNumber: maskPhone(toNumber) }, "sms: invalid destination number (must be E.164)");
     return { ok: false, reason: "invalid_input" };

@@ -15,6 +15,7 @@ import {
   toSpokenReply,
   formatSsePayload,
   buildVoiceDebugInfo,
+  voiceDebugEnabled,
   DEFAULT_VAPI_SECRET_HEADER,
   type VapiMessage,
 } from "./concierge";
@@ -117,12 +118,12 @@ const handleVoiceChat: import("express").RequestHandler = async (req, res) => {
     // echo, or carrier SID can ever reach the logger.
     //
     // PRODUCTION WARNING: this block still logs COMPLETE guest phone numbers and
-    // raw message text (incl. keypad-entered numbers). It is guarded off by
-    // default (env must be exactly "true") and MUST remain disabled in
-    // production. The always-on logs above are already masked, so normal
-    // production logging is safe without this flag — enable it only for
-    // short-lived local debugging.
-    if (process.env.VOICE_DEBUG_LOG === "true") {
+    // raw message text (incl. keypad-entered numbers). It is gated by
+    // voiceDebugEnabled, which requires the flag to be exactly "true" AND
+    // NODE_ENV !== "production" — so even a flag accidentally left on cannot leak
+    // in production. The always-on logs above are already masked, so normal
+    // production logging is safe without this flag.
+    if (voiceDebugEnabled(process.env.VOICE_DEBUG_LOG, process.env.NODE_ENV)) {
       req.log.info(
         buildVoiceDebugInfo(body, mapped, callId),
         "voice: curated debug info (VOICE_DEBUG_LOG)"
@@ -152,7 +153,15 @@ const handleVoiceChat: import("express").RequestHandler = async (req, res) => {
       reply = toSpokenReply(candidate, spokenOpts);
     } else {
       const outcome = await orchestrateBookingSms(
-        { links, callId, callerNumber, messages: mapped, motelName: motel.identity.name, spokenOpts },
+        {
+          links,
+          callId,
+          callerNumber,
+          messages: mapped,
+          motelName: motel.identity.name,
+          bookingConfig: { hotelId: motel.booking.hotelId, linkBase: motel.booking.linkBase },
+          spokenOpts,
+        },
         {
           checkAvailability,
           sendSms: (to, smsBody) => sendBookingLinkSms(to, smsBody, req.log),
@@ -167,7 +176,7 @@ const handleVoiceChat: import("express").RequestHandler = async (req, res) => {
       );
     }
 
-    if (process.env.VOICE_DEBUG_LOG === "true") {
+    if (voiceDebugEnabled(process.env.VOICE_DEBUG_LOG, process.env.NODE_ENV)) {
       req.log.info({ callId, reply }, "voice: outgoing spoken reply (VOICE_DEBUG_LOG)");
     }
 

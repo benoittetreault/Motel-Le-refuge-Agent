@@ -12,6 +12,7 @@ import {
   resolveGuestPhone,
   inviteToCallReply,
   smsSentReply,
+  voiceDebugEnabled,
 } from "./concierge";
 import type { ChatMessageList } from "../anthropic/chat-brain";
 
@@ -351,4 +352,19 @@ test("smsSentReply confirms the text was sent, with no URL and no phone number",
   assert.match(reply, /texto|text message/i);
   assert.doesNotMatch(reply, /reservit\.com|https?:\/\//i);
   assert.doesNotMatch(reply, /819-564-9005/);
+});
+
+// ---- voiceDebugEnabled: never expose full PII in production -----------------
+
+test("voiceDebugEnabled requires the flag AND a non-production env", () => {
+  // Enabled only when flag === "true" and NODE_ENV is not production.
+  assert.equal(voiceDebugEnabled("true", "development"), true);
+  assert.equal(voiceDebugEnabled("true", undefined), true);
+  assert.equal(voiceDebugEnabled("true", "test"), true);
+  // Never in production, even with the flag on.
+  assert.equal(voiceDebugEnabled("true", "production"), false);
+  // Off unless the flag is exactly "true".
+  assert.equal(voiceDebugEnabled(undefined, "development"), false);
+  assert.equal(voiceDebugEnabled("1", "development"), false);
+  assert.equal(voiceDebugEnabled("TRUE", "development"), false);
 });
