@@ -30,8 +30,16 @@ import {
 import type { SmsResult } from "../../lib/sms";
 import type { ChatMessageList } from "../anthropic/chat-brain";
 import type { SentLinkStore } from "./sent-link-store";
+import type { PendingBookingStore, PendingAvailability } from "./pending-booking-store";
 import type { DeadlineView } from "./deadline";
-import { inviteToCallReply, smsSentReply, resolveGuestPhone, type SpokenReplyOpts } from "./concierge";
+import {
+  inviteToCallReply,
+  smsSentReply,
+  availableNeedsNumberReply,
+  unavailableReply,
+  resolveGuestPhone,
+  type SpokenReplyOpts,
+} from "./concierge";
 
 // Minimum time we insist on having left before STARTING a Twilio send: the
 // provider call itself is bounded at ~4s, so if less than this remains we would
@@ -41,11 +49,13 @@ import { inviteToCallReply, smsSentReply, resolveGuestPhone, type SpokenReplyOpt
 const SMS_MIN_BUDGET_MS = 4500;
 
 // Injected side-effecting dependencies. The route passes the real
-// checkAvailability / sendBookingLinkSms / singleton store; tests pass fakes.
+// checkAvailability / sendBookingLinkSms / singleton stores; tests pass fakes.
 export interface BookingSmsDeps {
   checkAvailability: (arrivalDate: string, nights: number, adults: number) => Promise<AvailabilityResult>;
   sendSms: (to: string, body: string) => Promise<SmsResult>;
   store: SentLinkStore;
+  /** Remembers an available booking awaiting a keypad number (continuation). */
+  pendingStore: PendingBookingStore;
 }
 
 /** Trusted, server-side booking config used to rebuild the canonical link. */
@@ -79,15 +89,16 @@ export interface BookingSmsInput {
 // Machine-readable outcome for structured logging. No secrets, no phone numbers,
 // no URLs — safe to log as-is.
 export type BookingSmsStatus =
-  | "sent" // SMS sent this turn.
+  | "available_sent" // available AND the SMS was sent this turn.
+  | "available_needs_number" // available, but no number yet — asked for keypad entry.
+  | "unavailable" // server re-check says the dates are not bookable.
   | "duplicate" // already sent earlier this call; no second SMS.
   | "in_flight" // a concurrent turn is already sending; this turn does not send.
-  | "not_available" // server re-check says the dates are not bookable.
   | "invalid_link" // a link failed strict validation (bad host/path/hotelid/params).
   | "missing_call_id" // no stable call id → cannot dedup, so we do not send.
-  | "no_number" // no verified/keyed guest number to text.
-  | "deadline_exceeded" // not enough time left to safely send before the voice deadline.
-  | "send_failed"; // Twilio (or config) failure.
+  | "send_failed" // Twilio (or config) failure.
+  | "timed_out" // not enough time left to safely send before the voice deadline.
+  | "no_booking"; // no link this turn and no pending booking — route speaks the model reply.
 
 export interface BookingSmsOutcome {
   /** The safe, code-authored text to speak. Never contains a URL. */
@@ -115,99 +126,124 @@ function buildSmsBody(urls: string[], motelName: string): string {
 
 // A booking is bookable if the server re-check says all_available, OR if we
 // simply could NOT reach Reservit (check_failed). A definitive negative
-// (none_available / partial / too_long) blocks the send. Note: check_failed is
-// "could not verify", never "verified" — we do not claim verification when
-// Reservit was unreachable; the booking page shows live availability.
+// (none_available / partial / too_long) blocks. Note: check_failed is "could not
+// verify", never "verified" — the booking page shows live availability.
 function isDefinitiveFailure(result: AvailabilityResult): boolean {
   return result.status !== "all_available" && result.status !== "check_failed";
 }
 
+/** Validate + rebuild the current turn's model links into canonical bookings. */
+function buildFromLinks(
+  links: string[],
+  bookingConfig: BookingConfig
+): { bookings: ReservitBooking[]; canonicalUrls: string[] } | null {
+  const bookings: ReservitBooking[] = [];
+  for (const link of links) {
+    const booking = parseAndValidateReservitLink(link, bookingConfig.hotelId);
+    if (!booking) return null; // any invalid link rejects the whole turn
+    bookings.push(booking);
+  }
+  const canonicalUrls = bookings.map((b) =>
+    buildReservitLink(bookingConfig.linkBase, bookingConfig.hotelId, b)
+  );
+  return { bookings, canonicalUrls };
+}
+
+/**
+ * Decide, for a booking-relevant voice turn, what to do and what to say. The
+ * booking to act on comes from EITHER the model's freshly-emitted link(s) (which
+ * are strictly validated + rebuilt server-side) OR a pending booking remembered
+ * from an earlier "available, please key your number" turn. Availability is
+ * ALWAYS checked (even with no number) so the result can be stated to the guest;
+ * a stay is only ever texted after a successful Twilio send.
+ */
 export async function orchestrateBookingSms(
   input: BookingSmsInput,
   deps: BookingSmsDeps
 ): Promise<BookingSmsOutcome> {
-  const { links, callId, callerNumber, messages, motelName, bookingConfig, spokenOpts } = input;
+  const { links, callId, callerNumber, messages, motelName, bookingConfig, spokenOpts, deadline } = input;
   const invite = (status: BookingSmsStatus, smsReason?: BookingSmsOutcome["smsReason"]): BookingSmsOutcome => ({
     reply: inviteToCallReply(spokenOpts),
     status,
     smsReason,
   });
 
-  // 0. Idempotency requires a stable call id. Without one we cannot safely dedup
-  //    across repeated/malformed turns, so we do NOT send.
+  // 0. Idempotency requires a stable call id.
   if (!callId) return invite("missing_call_id");
 
-  // 1. Strictly validate EVERY link against our hotel id, then rebuild each URL
-  //    server-side from trusted config. Any invalid link rejects the whole turn
-  //    (never text a partially-trusted set).
-  const bookings: ReservitBooking[] = [];
-  for (const link of links) {
-    const booking = parseAndValidateReservitLink(link, bookingConfig.hotelId);
-    if (!booking) return invite("invalid_link");
-    bookings.push(booking);
+  // 1. Resolve the booking source. Fresh model link(s) take precedence; otherwise
+  //    fall back to a pending booking (keypad-continuation turn). If neither, this
+  //    is a normal conversational turn — the route speaks the model's reply.
+  let bookings: ReservitBooking[];
+  let canonicalUrls: string[];
+  if (links.length > 0) {
+    const built = buildFromLinks(links, bookingConfig);
+    if (!built) return invite("invalid_link");
+    ({ bookings, canonicalUrls } = built);
+  } else {
+    const pending = deps.pendingStore.get(callId);
+    if (!pending) return { reply: "", status: "no_booking" };
+    ({ bookings, canonicalUrls } = pending);
   }
-  const canonicalUrls = bookings.map((b) =>
-    buildReservitLink(bookingConfig.linkBase, bookingConfig.hotelId, b)
-  );
   const key = dedupKey(canonicalUrls);
 
-  // 2. Atomic claim BEFORE any await — this is the concurrency gate.
+  // 2. Atomic claim BEFORE any await — the concurrency gate.
   const claim = deps.store.claim(callId, key);
-  if (claim === "already_sent") {
-    return { reply: smsSentReply(), status: "duplicate" };
-  }
-  if (claim === "in_flight") {
-    // Another turn is sending this exact booking right now. We must not send,
-    // and we must not falsely claim it was sent from THIS turn.
-    return invite("in_flight");
-  }
+  if (claim === "already_sent") return { reply: smsSentReply(), status: "duplicate" };
+  if (claim === "in_flight") return invite("in_flight");
 
-  // We now hold the claim. From here, every non-success path must release it so
-  // a later turn can retry.
+  // We hold the claim; every non-success path must release it so a later turn can
+  // retry. Pending is set only when we still owe the guest a send.
   try {
-    // 3. Resolve the guest's number FIRST (cheap, no network). If there is none
-    //    we will not send, so we skip the availability round-trip entirely — this
-    //    is the common browser-webCall case and a key latency win.
-    const toNumber = resolveGuestPhone(callerNumber, messages);
-    if (!toNumber) {
-      deps.store.release(callId, key);
-      return invite("no_number");
-    }
-
-    // 4. Server-side availability re-verification (validated params, memoized per
+    // 3. Server-side availability re-verification (validated params, memoized per
     //    request so dates already checked in the model loop aren't re-fetched).
-    //    Only a definitive negative blocks.
     const results = await Promise.all(
       bookings.map((b) => deps.checkAvailability(b.arrivalDate, b.nights, b.adults))
     );
     if (results.some(isDefinitiveFailure)) {
       deps.store.release(callId, key);
-      return invite("not_available");
+      deps.pendingStore.clear(callId); // the offer is no longer valid
+      return { reply: unavailableReply(spokenOpts), status: "unavailable" };
+    }
+    const availability: PendingAvailability = results.every((r) => r.status === "all_available")
+      ? "available"
+      : "unverified";
+    const pendingSnapshot = { bookings, canonicalUrls, key, availability };
+
+    // 4. Resolve the guest's number (verified metadata → DTMF keypad). If none,
+    //    the stay IS available but we can't text yet: state availability and ask
+    //    for a keypad number, remembering the booking for the continuation turn.
+    const toNumber = resolveGuestPhone(callerNumber, messages);
+    if (!toNumber) {
+      deps.store.release(callId, key);
+      deps.pendingStore.set(callId, pendingSnapshot);
+      return { reply: availableNeedsNumberReply(), status: "available_needs_number" };
     }
 
-    // 4b. Deadline check — do NOT start a send we can't finish and confirm before
-    //     the voice deadline. Otherwise a late SMS could fire after the guest has
-    //     already heard the fallback. Release the claim so a later turn may retry.
-    const { deadline } = input;
+    // 5. Deadline check — never START a send we can't finish and confirm before
+    //    the voice deadline. Keep the pending booking so the next turn can retry.
     if (deadline && (deadline.expired() || deadline.remainingMs() < SMS_MIN_BUDGET_MS)) {
       deps.store.release(callId, key);
-      return invite("deadline_exceeded");
+      deps.pendingStore.set(callId, pendingSnapshot);
+      return invite("timed_out");
     }
 
-    // 5. Send the canonical (server-built) link(s). sendSms never throws.
+    // 6. Send the canonical (server-built) link(s). sendSms never throws.
     const result = await deps.sendSms(toNumber, buildSmsBody(canonicalUrls, motelName));
     if (result.ok) {
       deps.store.markSent(callId, key);
-      return { reply: smsSentReply(), status: "sent" };
+      deps.pendingStore.clear(callId);
+      return { reply: smsSentReply(), status: "available_sent" };
     }
 
-    // Failure: release so a later turn may retry; never claim success.
+    // Failure: release + keep pending so a later turn may retry; never claim success.
     deps.store.release(callId, key);
+    deps.pendingStore.set(callId, pendingSnapshot);
     return invite("send_failed", result.reason);
   } catch (err) {
     // Defensive: nothing above is expected to throw (checkAvailability fails
-    // closed to check_failed, sendSms is total), but if anything does, release
-    // the claim so the call is not permanently wedged, and fall back safely.
+    // closed, sendSms is total), but if anything does, release the claim so the
+    // call is not permanently wedged, and let the route fall back safely.
     deps.store.release(callId, key);
     throw err;
   }

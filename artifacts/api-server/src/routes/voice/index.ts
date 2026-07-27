@@ -8,6 +8,7 @@ import { sendBookingLinkSms } from "../../lib/sms";
 import { maskPhone } from "../../lib/redact";
 import { orchestrateBookingSms } from "./booking-sms";
 import { sentLinkStore } from "./sent-link-store";
+import { pendingBookingStore } from "./pending-booking-store";
 import { createTimings } from "./timing";
 import { createVoiceDeadline, withDeadline } from "./deadline";
 import {
@@ -16,6 +17,7 @@ import {
   extractProvidedSecret,
   toSpokenReply,
   inviteToCallReply,
+  resolveGuestPhone,
   formatSsePayload,
   buildVoiceDebugInfo,
   voiceDebugEnabled,
@@ -164,12 +166,17 @@ const handleVoiceChat: import("express").RequestHandler = async (req, res) => {
         generateReply(mapped, true, availability, timings.add)
       );
 
-      // A booking link must never be SPOKEN. No link → speak the candidate as-is;
-      // link(s) → orchestrator validates+rebuilds server-side, re-verifies (reusing
-      // the memoized availability), texts via Twilio, and returns a SAFE reply
-      // (URL never spoken; "sent" only after a successful send).
+      // Decide whether this turn is booking-relevant. We engage the orchestrator
+      // when the model emitted a booking link, OR when we're mid-flow with a
+      // pending booking (offered on an earlier "available — key your number" turn)
+      // and the guest has now provided a number. Otherwise it's a normal
+      // conversational turn and we speak the model's reply. A booking link is
+      // never SPOKEN — the orchestrator returns a SAFE, code-authored reply.
       const links = findAllReservitLinks(candidate);
-      if (links.length === 0) return toSpokenReply(candidate, spokenOpts);
+      const pending = callId ? pendingBookingStore.get(callId) : undefined;
+      const numberNow = resolveGuestPhone(callerNumber, mapped);
+      const engageBooking = links.length > 0 || (pending !== undefined && numberNow !== null);
+      if (!engageBooking) return toSpokenReply(candidate, spokenOpts);
 
       const outcome = await timings.time("orchestrate_sms", () =>
         orchestrateBookingSms(
@@ -187,6 +194,7 @@ const handleVoiceChat: import("express").RequestHandler = async (req, res) => {
             checkAvailability: availability,
             sendSms: (to, smsBody) => sendBookingLinkSms(to, smsBody, req.log, deadline.signal),
             store: sentLinkStore,
+            pendingStore: pendingBookingStore,
           }
         )
       );
@@ -195,7 +203,8 @@ const handleVoiceChat: import("express").RequestHandler = async (req, res) => {
         { callId, smsStatus: outcome.status, smsReason: outcome.smsReason },
         "voice: booking-link SMS outcome"
       );
-      return outcome.reply;
+      // "no_booking" means there was nothing to act on after all — speak the model.
+      return outcome.status === "no_booking" ? toSpokenReply(candidate, spokenOpts) : outcome.reply;
     };
 
     let timedOut = false;

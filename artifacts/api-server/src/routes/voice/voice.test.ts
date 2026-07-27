@@ -12,6 +12,8 @@ import {
   resolveGuestPhone,
   inviteToCallReply,
   smsSentReply,
+  availableNeedsNumberReply,
+  unavailableReply,
   voiceDebugEnabled,
 } from "./concierge";
 import type { ChatMessageList } from "../anthropic/chat-brain";
@@ -352,6 +354,28 @@ test("smsSentReply confirms the text was sent, with no URL and no phone number",
   assert.match(reply, /texto|text message/i);
   assert.doesNotMatch(reply, /reservit\.com|https?:\/\//i);
   assert.doesNotMatch(reply, /819-564-9005/);
+});
+
+test("availableNeedsNumberReply states availability + asks for keypad #, no URL, no false claim", () => {
+  const reply = availableNeedsNumberReply();
+  assert.match(reply, /disponible/); // FR availability
+  assert.match(reply, /available/i); // EN availability
+  assert.match(reply, /clavier/); // FR keypad
+  assert.match(reply, /keypad/i); // EN keypad
+  assert.match(reply, /carré/); // FR pound/#
+  assert.match(reply, /pound/i); // EN pound/#
+  // Never claims an SMS was ALREADY sent, never speaks a URL.
+  assert.doesNotMatch(reply, /viens de vous envoyer|just sent/i);
+  assert.doesNotMatch(reply, /reservit\.com|https?:\/\//i);
+});
+
+test("unavailableReply states unavailability + phone, no URL, no false claim", () => {
+  const reply = unavailableReply(OPTS);
+  assert.match(reply, /pas disponibles/);
+  assert.match(reply, /aren't available/i);
+  assert.match(reply, /819-564-9005/); // phone offered as an alternative
+  assert.doesNotMatch(reply, /viens de vous envoyer|just sent/i);
+  assert.doesNotMatch(reply, /reservit\.com|https?:\/\//i);
 });
 
 // ---- voiceDebugEnabled: never expose full PII in production -----------------

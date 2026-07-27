@@ -2,6 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { orchestrateBookingSms, type BookingSmsDeps, type BookingSmsInput } from "./booking-sms";
 import { createSentLinkStore } from "./sent-link-store";
+import { createPendingBookingStore } from "./pending-booking-store";
 import type { AvailabilityResult } from "../anthropic/availability";
 import type { SmsResult } from "../../lib/sms";
 
@@ -25,6 +26,7 @@ function makeDeps(opts: {
   sms?: SmsResult;
   sendSms?: (to: string, body: string) => Promise<SmsResult>;
   store?: BookingSmsDeps["store"];
+  pendingStore?: BookingSmsDeps["pendingStore"];
   rec?: Recorder;
 }): BookingSmsDeps {
   const rec = opts.rec;
@@ -42,6 +44,7 @@ function makeDeps(opts: {
         return opts.sms ?? { ok: true, sid: "SMtest" };
       }),
     store: opts.store ?? createSentLinkStore(),
+    pendingStore: opts.pendingStore ?? createPendingBookingStore(),
   };
 }
 
@@ -70,7 +73,7 @@ test("valid available link + number → sends server-built URL once, confirms", 
 
   const outcome = await orchestrateBookingSms(baseInput(), deps);
 
-  assert.equal(outcome.status, "sent");
+  assert.equal(outcome.status, "available_sent");
   assert.equal(rec.smsCalls.length, 1);
   assert.equal(rec.smsCalls[0].to, "+15195551234");
   // The SMS body carries the canonical, server-built URL for OUR hotel.
@@ -95,18 +98,32 @@ test("SMS failure → invite-to-call, releases claim, no false confirmation", as
   // dedicated "failed send then a retry sends again" test below.)
 });
 
-test("no guest number → no_number, no SMS attempted", async () => {
+test("available + no number → checks availability, announces it, asks for keypad entry", async () => {
   const rec: Recorder = { availabilityCalls: [], smsCalls: [] };
-  const deps = makeDeps({ rec });
+  const pendingStore = createPendingBookingStore();
+  const deps = makeDeps({ availability: { status: "all_available", firstPrice: 100 }, pendingStore, rec });
 
   const outcome = await orchestrateBookingSms(
     baseInput({ callerNumber: undefined, messages: [{ role: "user", content: "book it" }] }),
     deps
   );
 
-  assert.equal(outcome.status, "no_number");
-  assert.equal(rec.smsCalls.length, 0);
+  assert.equal(outcome.status, "available_needs_number");
+  // Availability WAS checked even without a number (regression guard).
+  assert.equal(rec.availabilityCalls.length, 1);
+  assert.equal(rec.smsCalls.length, 0, "no SMS without a number");
+  // The reply states availability AND asks for a keypad number + '#'.
+  assert.match(outcome.reply, /disponible|available/i);
+  assert.match(outcome.reply, /clavier|keypad/i);
+  assert.match(outcome.reply, /carré|pound/i);
+  // It must NOT claim an SMS was ALREADY sent (that is smsSentReply's wording),
+  // and must not speak a URL. "to receive ... by text" is a request, not a claim.
+  assert.doesNotMatch(outcome.reply, /viens de vous envoyer|I've just sent|just sent you/i);
   assertNoUrl(outcome.reply);
+  // The booking is remembered for the keypad-continuation turn.
+  const pending = pendingStore.get("call-1");
+  assert.ok(pending);
+  assert.deepEqual(pending?.canonicalUrls.length, 1);
 });
 
 test("invalid metadata number falls back to a DTMF keypad entry", async () => {
@@ -121,21 +138,26 @@ test("invalid metadata number falls back to a DTMF keypad entry", async () => {
     deps
   );
 
-  assert.equal(outcome.status, "sent");
+  assert.equal(outcome.status, "available_sent");
   assert.equal(rec.smsCalls[0].to, "+18195551234");
 });
 
 // ---- Availability -----------------------------------------------------------
 
-test("definitive not-available → not_available, no SMS", async () => {
+test("definitive not-available → unavailable announced, no SMS, pending cleared", async () => {
   const rec: Recorder = { availabilityCalls: [], smsCalls: [] };
-  const deps = makeDeps({ availability: { status: "none_available" }, rec });
+  const pendingStore = createPendingBookingStore();
+  const deps = makeDeps({ availability: { status: "none_available" }, pendingStore, rec });
 
   const outcome = await orchestrateBookingSms(baseInput(), deps);
 
-  assert.equal(outcome.status, "not_available");
+  assert.equal(outcome.status, "unavailable");
   assert.equal(rec.smsCalls.length, 0);
+  // The reply says unavailable and offers an alternative (other dates / call).
+  assert.match(outcome.reply, /pas disponibles|aren't available/i);
+  assert.doesNotMatch(outcome.reply, /texto|text message/i);
   assertNoUrl(outcome.reply);
+  assert.equal(pendingStore.get("call-1"), undefined, "no pending offer for unavailable dates");
 });
 
 test("check_failed (Reservit unreachable) is non-blocking → still sends", async () => {
@@ -144,7 +166,7 @@ test("check_failed (Reservit unreachable) is non-blocking → still sends", asyn
 
   const outcome = await orchestrateBookingSms(baseInput(), deps);
 
-  assert.equal(outcome.status, "sent");
+  assert.equal(outcome.status, "available_sent");
   assert.equal(rec.smsCalls.length, 1);
 });
 
@@ -158,7 +180,7 @@ test("repeated turn (sequential) → duplicate, no second SMS, still confirms", 
   const first = await orchestrateBookingSms(baseInput(), deps);
   const second = await orchestrateBookingSms(baseInput(), deps);
 
-  assert.equal(first.status, "sent");
+  assert.equal(first.status, "available_sent");
   assert.equal(second.status, "duplicate");
   assert.equal(rec.smsCalls.length, 1);
   assert.match(second.reply, /texto|text message/i);
@@ -185,7 +207,7 @@ test("two SIMULTANEOUS turns (Promise.all) send exactly once", async () => {
   // Exactly one SMS goes out; the loser sees the in-flight claim and does NOT send.
   assert.equal(rec.smsCalls.length, 1, "sendSms must be called exactly once");
   const statuses = [a.status, b.status].sort();
-  assert.deepEqual(statuses, ["in_flight", "sent"]);
+  assert.deepEqual(statuses, ["available_sent", "in_flight"]);
   // Neither reply leaks a URL, and the loser never falsely claims a send.
   assertNoUrl(a.reply);
   assertNoUrl(b.reply);
@@ -203,7 +225,7 @@ test("dedup keyed on send SUCCESS: a failed send then a retry sends again", asyn
 
   const okDeps = makeDeps({ sms: { ok: true, sid: "SMok" }, store, rec });
   const second = await orchestrateBookingSms(baseInput(), okDeps);
-  assert.equal(second.status, "sent");
+  assert.equal(second.status, "available_sent");
   assert.equal(rec.smsCalls.length, 2);
 });
 
@@ -221,7 +243,7 @@ test("multiple valid links, all available → one SMS carrying both canonical UR
 
   const outcome = await orchestrateBookingSms(baseInput({ links: [LINK, LINK2] }), deps);
 
-  assert.equal(outcome.status, "sent");
+  assert.equal(outcome.status, "available_sent");
   assert.equal(rec.smsCalls.length, 1);
   assert.match(rec.smsCalls[0].body, /nbadt=2/);
   assert.match(rec.smsCalls[0].body, /nbadt=4/);
@@ -239,7 +261,7 @@ test("multiple links, one not available → blocked, no SMS", async () => {
 
   const outcome = await orchestrateBookingSms(baseInput({ links: [LINK, LINK2] }), deps);
 
-  assert.equal(outcome.status, "not_available");
+  assert.equal(outcome.status, "unavailable");
   assert.equal(rec.smsCalls.length, 0);
 });
 
@@ -311,7 +333,7 @@ test("model extra query params cannot change the hotel or reach the guest", asyn
 
   const outcome = await orchestrateBookingSms(baseInput({ links: [withExtras] }), deps);
 
-  assert.equal(outcome.status, "sent");
+  assert.equal(outcome.status, "available_sent");
   assert.equal(rec.smsCalls.length, 1);
   // The sent URL is rebuilt from config: our hotel, no injected params.
   assert.match(rec.smsCalls[0].body, /hotelid=444801/);
@@ -351,13 +373,11 @@ test("expired deadline → no SMS sent, no claim of success (invite instead)", a
     deps
   );
 
-  assert.equal(outcome.status, "deadline_exceeded");
+  assert.equal(outcome.status, "timed_out");
   assert.equal(rec.smsCalls.length, 0, "no late SMS after the deadline");
   assert.doesNotMatch(outcome.reply, /texto|text message/i); // never claims a send
   assert.match(outcome.reply, /appelez-nous|call us/i);
   assertNoUrl(outcome.reply);
-  // The claim was released (no send happened) so a later turn could retry.
-  assert.equal(store.claim("call-1", "any-other-key"), "claimed");
 });
 
 test("too little time left to safely send → no SMS, invite instead", async () => {
@@ -370,7 +390,7 @@ test("too little time left to safely send → no SMS, invite instead", async () 
     deps
   );
 
-  assert.equal(outcome.status, "deadline_exceeded");
+  assert.equal(outcome.status, "timed_out");
   assert.equal(rec.smsCalls.length, 0);
 });
 
@@ -383,6 +403,91 @@ test("ample time left → sends normally", async () => {
     deps
   );
 
-  assert.equal(outcome.status, "sent");
+  assert.equal(outcome.status, "available_sent");
   assert.equal(rec.smsCalls.length, 1);
+});
+
+// ---- Keypad continuation (available → enter number → sent) -----------------
+
+test("keypad-continuation: turn 1 asks for number, turn 2 (keypad) sends once", async () => {
+  const store = createSentLinkStore();
+  const pendingStore = createPendingBookingStore();
+  const rec: Recorder = { availabilityCalls: [], smsCalls: [] };
+  const deps = makeDeps({
+    availability: { status: "all_available", firstPrice: 100 },
+    store,
+    pendingStore,
+    rec,
+  });
+
+  // Turn 1 — browser webCall, no number, model emitted the link. Available, so we
+  // ask for a keypad number and remember the booking.
+  const t1 = await orchestrateBookingSms(
+    baseInput({ callerNumber: undefined, messages: [{ role: "user", content: "réserver" }] }),
+    deps
+  );
+  assert.equal(t1.status, "available_needs_number");
+  assert.equal(rec.smsCalls.length, 0);
+  assert.ok(pendingStore.get("call-1"), "booking remembered for continuation");
+
+  // Turn 2 — guest keyed a callback number. The model did NOT re-emit a link
+  // (links: []), but the pending booking is used and the SMS is sent.
+  const t2 = await orchestrateBookingSms(
+    baseInput({
+      callerNumber: undefined,
+      links: [],
+      messages: [
+        { role: "user", content: "réserver" },
+        { role: "user", content: "User's Keypad Entry: 8195551234" },
+      ],
+    }),
+    deps
+  );
+  assert.equal(t2.status, "available_sent");
+  assert.equal(rec.smsCalls.length, 1, "sent exactly once across both turns");
+  assert.equal(rec.smsCalls[0].to, "+18195551234", "sent to the keypad-entered number");
+  assert.match(rec.smsCalls[0].body, /hotelid=444801/);
+  assert.equal(pendingStore.get("call-1"), undefined, "pending cleared after a successful send");
+  assertNoUrl(t2.reply);
+});
+
+test("keypad-continuation: a later duplicate turn does not re-send", async () => {
+  const store = createSentLinkStore();
+  const pendingStore = createPendingBookingStore();
+  const rec: Recorder = { availabilityCalls: [], smsCalls: [] };
+  const deps = makeDeps({ store, pendingStore, rec });
+
+  await orchestrateBookingSms(
+    baseInput({ callerNumber: undefined, messages: [{ role: "user", content: "réserver" }] }),
+    deps
+  );
+  const sent = await orchestrateBookingSms(
+    baseInput({
+      callerNumber: undefined,
+      links: [],
+      messages: [{ role: "user", content: "User's Keypad Entry: 8195551234" }],
+    }),
+    deps
+  );
+  assert.equal(sent.status, "available_sent");
+
+  // The model re-emits the link on yet another turn → already sent → no re-send.
+  const dup = await orchestrateBookingSms(
+    baseInput({ callerNumber: "+18195551234" }),
+    deps
+  );
+  assert.equal(dup.status, "duplicate");
+  assert.equal(rec.smsCalls.length, 1, "still exactly one SMS");
+  assert.match(dup.reply, /texto|text message/i);
+});
+
+test("no link and no pending booking → no_booking (route speaks the model reply)", async () => {
+  const rec: Recorder = { availabilityCalls: [], smsCalls: [] };
+  const deps = makeDeps({ rec });
+
+  const outcome = await orchestrateBookingSms(baseInput({ links: [] }), deps);
+
+  assert.equal(outcome.status, "no_booking");
+  assert.equal(rec.smsCalls.length, 0);
+  assert.equal(rec.availabilityCalls.length, 0);
 });

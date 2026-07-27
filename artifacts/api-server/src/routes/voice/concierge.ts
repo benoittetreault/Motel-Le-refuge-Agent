@@ -171,6 +171,31 @@ export function smsSentReply(): string {
   );
 }
 
+// Spoken when the requested stay IS available but we have no number to text yet
+// (e.g. a browser webCall with no caller id). It states availability AND asks the
+// guest to key a callback number followed by "#". It never claims an SMS was
+// sent and never speaks a URL. TTS-friendly and bilingual.
+export function availableNeedsNumberReply(): string {
+  return (
+    "Bonne nouvelle, une chambre est disponible pour ces dates. Pour recevoir le " +
+    "lien de réservation par texto, entrez votre numéro de téléphone au clavier, " +
+    "puis appuyez sur le carré. / " +
+    "Good news, a room is available for those dates. To receive the booking link " +
+    "by text, enter your phone number on the keypad, then press the pound key."
+  );
+}
+
+// Spoken when the requested stay is NOT available. States unavailability, offers
+// to try other dates, and gives the phone as an alternative. Never sends an SMS.
+export function unavailableReply(opts: SpokenReplyOpts): string {
+  return (
+    `Malheureusement, ces dates ne sont pas disponibles. Souhaitez-vous essayer ` +
+    `d'autres dates, ou vous pouvez nous appeler au ${opts.phone}. / ` +
+    `Unfortunately those dates aren't available. Would you like to try other ` +
+    `dates, or you can call us at ${opts.phone}.`
+  );
+}
+
 // The concierge net for turns WITHOUT SMS orchestration: turn the brain's
 // candidate reply into something safe to speak. If a booking link is present it
 // is replaced wholesale with the invite-to-call message (the SMS path in

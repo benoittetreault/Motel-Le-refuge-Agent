@@ -82,6 +82,19 @@ A browser webCall (`callId 019f9f4b…`) took ~22.2s server-side; Vapi abandoned
 
 New/changed for this fix: `timing.ts`(+test), `deadline.ts`(+test), `availability.ts`(+`availability.test.ts`), `chat-brain.ts` (inject availability + timing), `booking-sms.ts` (deadline gate), `sms.ts` (optional abort signal), `voice/index.ts` (wire it all).
 
+## Booking-flow regression fix (number-first → availability-first)
+
+The latency fix's "resolve number first" shortcut regressed the intended flow: a browser webCall (no `callerNumber`) exited to "call us" **without checking or announcing availability and without offering keypad entry**. Fixed so the voice agent matches web chat:
+
+- **Availability is always checked and announced**, even with no number (memoized cache keeps it cheap — usually a hit from the model's own tool call).
+- **Explicit outcomes**: `available_sent`, `available_needs_number`, `unavailable`, `send_failed`, `timed_out` (plus `duplicate`/`in_flight`/`invalid_link`/`missing_call_id`/`no_booking`).
+- **available_needs_number**: states the stay is available and asks the guest to key a callback number then `#` (bilingual, TTS-friendly, no URL, no "sent" claim).
+- **Keypad continuation**: a new **call-scoped pending-booking store** (`pending-booking-store.ts`, TTL 30 min) remembers only the **validated params + canonical server-built URL + availability state** (no transcripts, numbers, or secrets). On the next turn, if a keypad number arrives, the pending booking is sent — once — without relying on the model to re-emit the link. The route engages booking on a link OR (pending + a now-available number); otherwise it speaks the model reply.
+- **unavailable**: states unavailability, offers other dates / the phone, sends nothing, clears any pending offer.
+- Unchanged guarantees: URL never spoken; SMS only after a successful send; server-side validation/rebuild; concurrency-safe claim; 15s deadline + safe fallback.
+
+New: `pending-booking-store.ts`(+test); changed: `concierge.ts` (two new spoken replies), `booking-sms.ts` (dual booking source + outcomes + pending), `voice/index.ts` (engage logic + pending dep).
+
 ## Architecture decisions
 
 - **Concierge-net, not prompt rework.** Keeps the golden prompt frozen and makes the SMS
@@ -93,7 +106,7 @@ New/changed for this fix: `timing.ts`(+test), `deadline.ts`(+test), `availabilit
 
 ## Tests executed & results (run from the worktree)
 
-- `pnpm --filter @workspace/api-server test` → **117 pass / 0 fail** (Bloc B/C + log-redaction + hardening + latency fix).
+- `pnpm --filter @workspace/api-server test` → **127 pass / 0 fail** (Bloc B/C + redaction + hardening + latency + booking-flow regression fix).
 - `pnpm --filter @workspace/api-server typecheck` (after `npx tsc -b tsconfig.json`) → **exit 0**.
 - `node artifacts/api-server/build.mjs` (prod esbuild server bundle) → **exit 0**.
 - No lint step is configured in this repo.
