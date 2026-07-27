@@ -114,11 +114,12 @@ Vapi gère la **téléphonie** (ASR voix→texte, TTS texte→voix). Notre api-s
     → toute réponse contenant un lien est remplacée par une invitation bilingue à appeler
     (`phone` + heures) ; liens résiduels + tags d'outil strippés dans tous les cas.
   - `buildSseChunks` / `formatSsePayload` : formatage SSE (cf. §6.1).
-- **Flux du handler** : (debug opt-in) log headers+body bruts si `VOICE_DEBUG_LOG=true` →
-  **auth** (401 si secret invalide ; si `VAPI_SECRET` absent → warning + passage, dev only)
-  → extrait/log `call.phoneNumber.number` (appelé), `call.customer.number` (appelant),
-  `call.id` → `getMotelConfig(dialedNumber)` → `mapVapiMessages` (400 si vide) →
-  `generateReply` (**même cerveau que le web**) → `toSpokenReply` → réponse **SSE**.
+- **Flux du handler** : **auth** (401 si secret invalide ; si `VAPI_SECRET` absent → warning +
+  passage, dev only) → extrait `call.phoneNumber.number` (appelé), `call.customer.number`
+  (appelant), `call.id` ; le log normal « voice: incoming turn » **masque les numéros**
+  (`maskPhone` → `+1******1234`) → `getMotelConfig(dialedNumber)` → `mapVapiMessages` (400 si
+  vide) → (debug opt-in `VOICE_DEBUG_LOG=true`, cf. §6.5) → `generateReply` (**même cerveau que
+  le web**) → filet concierge / SMS (§8) → réponse **SSE**.
 - **Pas de persistance DB** en voix : Vapi renvoie l'historique **complet** à chaque tour.
 - **Jamais de `tool_calls` renvoyés à Vapi** : `check_availability` reste interne à
   `generateReply` (invisible pour Vapi).
@@ -168,6 +169,27 @@ Le header par défaut correspond à la config Vapi actuelle.
 - **Numéros gratuits Vapi ≠ indicatifs canadiens** : impossible d'obtenir un vrai numéro
   819 via les numéros gratuits Vapi → nécessitera « Import Twilio » plus tard.
 
+### 6.5 Redaction des logs — numéros invités & secrets
+
+Les **logs normaux (toujours actifs)** ne doivent JAMAIS contenir un numéro invité complet, le
+corps du SMS / lien de réservation, un token/SID Twilio, ni une valeur d'autorisation.
+
+- **Helper `maskPhone`** (`lib/redact.ts`, réutilisable, pur) : `+15195551234` → `+1******1234`
+  (garde 2 premiers + 4 derniers, masque le milieu ; entrée non-string/vide → `<no-number>` ;
+  ≤ 6 caractères → entièrement masqué). Utilisé par le log « voice: incoming turn » et par
+  `sms.ts` (chemin `invalid_input`).
+- **`sms.ts`** : sur non-2xx, on log **uniquement** `status` + `twilioCode` (code numérique
+  extrait du body), jamais le body brut (qui ré-échoit le numéro). Sur 2xx sans `sid`, on log
+  **les noms de champs** (`responseKeys`) et non leurs valeurs (le body Twilio contient `to` et
+  notre `body`=lien). Sur timeout/erreur réseau, on log **le nom** de l'erreur (`errName`), pas
+  l'objet brut (dont la stack/URL contient l'`accountSid`). L'en-tête `Authorization: Basic …`
+  n'est jamais loggé.
+- **`VOICE_DEBUG_LOG`** : opt-in, **désactivé par défaut** (env doit valoir exactement `"true"`).
+  Ce bloc log encore des **numéros complets + le texte des messages** (dont les saisies clavier).
+  Il **DOIT rester désactivé en production** — les logs toujours-actifs étant déjà masqués, la
+  prod est sûre sans ce flag ; ne l'activer que pour du débogage local court. La sécurité ne
+  repose PAS uniquement sur cette doc : les logs normaux sont masqués **dans le code**.
+
 ## 7. Décisions clés (et pourquoi)
 
 - **Vérif serveur APRÈS génération, sur le texte complet.** Bug prod (Deluxe, 4–5 juillet
@@ -186,17 +208,73 @@ Le header par défaut correspond à la config Vapi actuelle.
   l'import sans `ANTHROPIC_API_KEY` → toute logique testable (concierge, SSE, reservit-link)
   vit dans des modules purs importables sans clé (usage `import type` pour les types du cerveau).
 
-## 8. Plans en cours (non implémentés)
+## 8. Bloc B/C — lien de réservation par SMS (IMPLÉMENTÉ, non déployé)
 
-- **Bloc B — prompt vocal dédié.** Le Bloc A réutilise le prompt WEB tel quel (avec des
-  `TODO(Bloc B)`), d'où le filet `toSpokenReply` qui rattrape les liens *a posteriori*. Le
-  Bloc B doit : ne **jamais** produire de lien à la source, imposer des **phrases courtes**
-  (adaptées au TTS), et gérer le « First Message » de Vapi (message d'accueil).
-- **Bloc C — envoi du lien par SMS (via Twilio), planifié.** Après vérification de dispo
-  serveur, envoyer le lien Reservit par SMS plutôt que de le parler — en **réutilisant le
-  même point de détection** que le filet concierge actuel. **Capture du numéro** :
-  `call.customer.number` en priorité ; sinon saisie **clavier DTMF** via le `keypadInputPlan`
-  de Vapi. **JAMAIS de saisie vocale d'un numéro** (risque de transcription erronée).
+Livré ensemble (Bloc B et Bloc C ne peuvent PAS être déployés séparément : le Bloc B fait
+promettre l'envoi d'un SMS que seul le Bloc C réalise). Choix d'archi : **tout se joue dans
+la couche post-génération (« filet concierge »), le prompt partagé et son golden snapshot
+restent inchangés.** Le modèle produit toujours le lien Reservit dans son texte candidat ;
+c'est notre code, déterministe, qui décide de le texter et qui compose la confirmation
+parlée — donc l'assistant ne peut PAS dire « je vous ai envoyé le lien » sans envoi réussi.
+
+Flux (route voix, quand le candidat contient ≥ 1 lien) — `orchestrateBookingSms`
+(`routes/voice/booking-sms.ts`, deps injectées pour être testable sans serveur/Reservit/Twilio) :
+0. **`callId` obligatoire** : sans identifiant d'appel stable, pas de clé d'idempotence ⇒ on
+   n'envoie PAS (statut `missing_call_id`, invitation à appeler).
+1. **Validation stricte + reconstruction serveur** du lien (le lien du modèle est une entrée
+   **non fiable**) : `parseAndValidateReservitLink` vérifie hôte exact (`softbooker.reservit.com`),
+   chemin exact (`/reservit/reserhotel.php`), `hotelid` == config, et fday/fmonth/fyear/nbnights/
+   nbadt présents + numériques + plages valides + date réelle. **On jette l'URL du modèle** et on
+   reconstruit l'URL canonique via `buildReservitLink(config.linkBase, config.hotelId, …)`. Ainsi
+   un `hotelid` falsifié, un paramètre injecté ou un hôte sosie ne peut JAMAIS rediriger. Tout
+   lien invalide ⇒ `invalid_link`, aucun SMS.
+2. **Claim atomique** (`sent-link-store.ts`, machine à états par `(callId, clé)` : not-claimed →
+   in-flight → sent ; clé = `JSON.stringify` des URLs canoniques triées, anti-collision). `claim`
+   est **synchrone donc atomique** : deux tours concurrents ⇒ un seul obtient `claimed`, l'autre
+   voit `in_flight` et **n'envoie pas**. `already_sent` (tour ultérieur) ⇒ reparle la confirmation
+   sans re-texter. TTL 2 h ; l'in-flight expire aussi (anti-blocage si crash en plein envoi).
+3. **Re-vérif dispo serveur** (paramètres validés) : `checkAvailability` par booking ; `check_failed`
+   (Reservit injoignable) **ne bloque pas** — on ne prétend jamais « vérifié » quand Reservit est
+   injoignable —, mais `none_available/partial/too_long` bloque (release + invitation à appeler).
+4. **Numéro invité** (`resolveGuestPhone`) : `call.customer.number` (E.164 strict) en priorité,
+   sinon `extractKeypadPhone` (clavier DTMF). Jamais un numéro *dicté* volontairement. Aucun
+   numéro ⇒ release + invitation.
+5. **Envoi** `sendBookingLinkSms` (Twilio, `lib/sms.ts`, E.164 strict `/^\+[1-9]\d{7,14}$/`, ne
+   throw jamais). Succès ⇒ `markSent` + confirmation « envoyé par texto » (sans URL ni numéro
+   parlé). Échec ⇒ `release` (retry possible plus tard) + invitation. **Jamais** de fausse
+   promesse d'envoi.
+
+**Idempotence — 1 seul process.** `sent-link-store` vit en mémoire d'UN process Node : protège
+les tours concurrents/dupliqués **d'une même instance**, PAS entre instances. `railway.json` ne
+déclare aucune réplique et Railway défaut = **1 instance**, donc suffisant aujourd'hui ; mais
+**non vérifié** sur le dashboard live. Passer à > 1 réplique **casserait** l'idempotence — il
+faudrait alors un store partagé (Redis) ou une contrainte d'unicité en base.
+
+Env Twilio : `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, `TWILIO_FROM_NUMBER` (absents ⇒
+`not_configured` ⇒ fallback appel, jamais de fausse promesse). Le chat **web** est inchangé :
+toute la logique SMS vit dans la route voix. **Reste optionnel (nécessiterait golden + review
+Benoit)** : un prompt vocal dédié (phrases courtes TTS, lien-free à la source, First Message
+Vapi) — non requis pour la correction, l'approche concierge le rend superflu.
+
+### 8.1 Latence voix — dédup dispo + deadline (correctif live)
+
+Défaut observé (pr-27-test) : ~22 s de traitement, Vapi abandonne à ~20 s
+(`providerfault-model-no-response`). Corrigé sur trois axes :
+- **Dédup dispo intra-requête** : `createRequestAvailability` (availability.ts) mémoïse la
+  **promesse** par `arrivalDate+nights+adults`, partagée entre la boucle d'outils de
+  `generateReply` et l'orchestrateur SMS ⇒ mêmes dates vérifiées **une seule fois** chez
+  Reservit. Validation **inchangée** (hôte/chemin/hotelid/date, URL reconstruite serveur) ; le
+  cache ne réutilise qu'un résultat correspondant **exactement** aux paramètres validés. Neuf à
+  chaque requête (jamais de cache inter-requêtes périmé).
+- **Deadline dure** : `createVoiceDeadline` (15 s) + `withDeadline` autour de tout le pipeline.
+  Si on ne finit pas à temps ⇒ repli parlé **invitation à appeler** (jamais de dispo ni d'SMS
+  prétendus), bien avant les 20 s de Vapi. Cible < 12 s, plafond 15 s.
+- **Pas d'SMS tardif ni faux** : l'orchestrateur reçoit `deadline` ; avant d'envoyer, il refuse
+  si expiré ou si < ~4,5 s de budget (release + invitation). Le `fetch` Twilio reçoit aussi
+  `deadline.signal` ⇒ un envoi en vol s'annule à l'échéance.
+- **Instrumentation** : log `voice: request timing` sans PII — `{ totalMs, timedOut, timings }`
+  (agrégats `model_round` / `check_availability` / `availability_cache_hit` / `reservit_night` /
+  `generate_reply` / `orchestrate_sms` / `sse_write`, durées et compteurs uniquement).
 
 ## 9. Limites connues & questions ouvertes
 

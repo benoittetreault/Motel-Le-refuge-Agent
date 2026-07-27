@@ -100,10 +100,21 @@ async function checkNight(fromdate: string, adults: number): Promise<NightResult
  * Fails closed: if ANY night's request throws or times out, the entire result
  * is `check_failed` — we never report a partial/guessed answer on error.
  */
-export async function checkAvailability(
+/** Optional duration sink (label, ms) — never receives PII, only timings. */
+export type CheckTimingSink = (label: string, ms: number) => void;
+
+/** The shared shape of a booking-availability check. */
+export type CheckAvailabilityFn = (
   fromDate: string,
   nights: number,
   adults: number
+) => Promise<AvailabilityResult>;
+
+export async function checkAvailability(
+  fromDate: string,
+  nights: number,
+  adults: number,
+  onTiming?: CheckTimingSink
 ): Promise<AvailabilityResult> {
   if (nights > MAX_NIGHTS) {
     return { status: "too_long", requestedNights: nights };
@@ -111,12 +122,19 @@ export async function checkAvailability(
 
   const adultCount = Math.max(1, adults);
 
+  const timedNight = async (from: string): Promise<NightResult> => {
+    const start = Date.now();
+    try {
+      return await checkNight(from, adultCount);
+    } finally {
+      onTiming?.("reservit_night", Date.now() - start);
+    }
+  };
+
   let results: NightResult[];
   try {
     results = await Promise.all(
-      Array.from({ length: nights }, (_, i) =>
-        checkNight(addUtcDays(fromDate, i), adultCount)
-      )
+      Array.from({ length: nights }, (_, i) => timedNight(addUtcDays(fromDate, i)))
     );
   } catch {
     // Any single-night failure poisons the whole check.
@@ -133,4 +151,42 @@ export async function checkAvailability(
     return { status: "none_available" };
   }
   return { status: "partial", availableNights, bookedNights };
+}
+
+/**
+ * Wrap a check function with a REQUEST-SCOPED memo so the same
+ * (arrivalDate, nights, adults) is only sent to Reservit once per voice request.
+ *
+ * Why: within one turn the model's tool loop checks availability, and then the
+ * SMS orchestrator re-verifies the same dates before texting the link — two
+ * identical network round-trips. This cache collapses them WITHOUT weakening
+ * anything: it is created fresh per request (never a stale cross-request cache),
+ * keyed EXACTLY by arrivalDate + nights + adults, so a different query still
+ * triggers a real check, and the orchestrator only ever reuses a result that
+ * corresponds exactly to the params it validated from the server-built link.
+ *
+ * The promise (not the resolved value) is cached, so concurrent identical calls
+ * share one in-flight request. `checkAvailability` never rejects (it fails closed
+ * to `check_failed`), so a cached promise is always safe to await repeatedly.
+ */
+export function createRequestAvailability(
+  check: CheckAvailabilityFn = checkAvailability,
+  onTiming?: CheckTimingSink
+): CheckAvailabilityFn {
+  const cache = new Map<string, Promise<AvailabilityResult>>();
+  return (fromDate, nights, adults) => {
+    const key = `${fromDate}|${nights}|${adults}`;
+    const hit = cache.get(key);
+    if (hit) {
+      onTiming?.("availability_cache_hit", 0);
+      return hit;
+    }
+    const start = Date.now();
+    const pending = check(fromDate, nights, adults).then((result) => {
+      onTiming?.("check_availability", Date.now() - start);
+      return result;
+    });
+    cache.set(key, pending);
+    return pending;
+  };
 }

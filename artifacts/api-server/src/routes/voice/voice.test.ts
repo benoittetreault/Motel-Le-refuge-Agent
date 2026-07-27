@@ -9,6 +9,12 @@ import {
   formatSsePayload,
   buildVoiceDebugInfo,
   extractKeypadPhone,
+  resolveGuestPhone,
+  inviteToCallReply,
+  smsSentReply,
+  availableNeedsNumberReply,
+  unavailableReply,
+  voiceDebugEnabled,
 } from "./concierge";
 import type { ChatMessageList } from "../anthropic/chat-brain";
 
@@ -308,4 +314,81 @@ test("extractKeypadPhone: found by scanning backward past later user turns", () 
     { role: "user", content: "book it" },
   ];
   assert.equal(extractKeypadPhone(history), "+18195551234");
+});
+
+// ---- resolveGuestPhone (verified metadata first, then DTMF keypad) -----------
+
+test("resolveGuestPhone prefers a valid E.164 caller number from metadata", () => {
+  const history: ChatMessageList = [
+    { role: "user", content: "User's Keypad Entry: 8195551234" }, // present but must be ignored
+  ];
+  assert.equal(resolveGuestPhone("+15145550000", history), "+15145550000");
+});
+
+test("resolveGuestPhone falls back to the keypad when metadata is missing/invalid", () => {
+  const history: ChatMessageList = [
+    { role: "user", content: "User's Keypad Entry: 8195551234" },
+  ];
+  assert.equal(resolveGuestPhone(undefined, history), "+18195551234");
+  assert.equal(resolveGuestPhone("anonymous", history), "+18195551234");
+  assert.equal(resolveGuestPhone("+12", history), "+18195551234"); // too short → not E.164
+});
+
+test("resolveGuestPhone returns null when neither source yields a number", () => {
+  const history: ChatMessageList = [{ role: "user", content: "book it" }];
+  assert.equal(resolveGuestPhone(undefined, history), null);
+});
+
+// ---- Spoken reply helpers: never leak a URL, never over-promise -------------
+
+test("inviteToCallReply names the phone/hours and claims no SMS", () => {
+  const reply = inviteToCallReply(OPTS);
+  assert.match(reply, /819-564-9005/);
+  assert.match(reply, /appelez-nous|call us/);
+  assert.doesNotMatch(reply, /texto|text message/i);
+  assert.doesNotMatch(reply, /reservit\.com|https?:\/\//i);
+});
+
+test("smsSentReply confirms the text was sent, with no URL and no phone number", () => {
+  const reply = smsSentReply();
+  assert.match(reply, /texto|text message/i);
+  assert.doesNotMatch(reply, /reservit\.com|https?:\/\//i);
+  assert.doesNotMatch(reply, /819-564-9005/);
+});
+
+test("availableNeedsNumberReply states availability + asks for keypad #, no URL, no false claim", () => {
+  const reply = availableNeedsNumberReply();
+  assert.match(reply, /disponible/); // FR availability
+  assert.match(reply, /available/i); // EN availability
+  assert.match(reply, /clavier/); // FR keypad
+  assert.match(reply, /keypad/i); // EN keypad
+  assert.match(reply, /carré/); // FR pound/#
+  assert.match(reply, /pound/i); // EN pound/#
+  // Never claims an SMS was ALREADY sent, never speaks a URL.
+  assert.doesNotMatch(reply, /viens de vous envoyer|just sent/i);
+  assert.doesNotMatch(reply, /reservit\.com|https?:\/\//i);
+});
+
+test("unavailableReply states unavailability + phone, no URL, no false claim", () => {
+  const reply = unavailableReply(OPTS);
+  assert.match(reply, /pas disponibles/);
+  assert.match(reply, /aren't available/i);
+  assert.match(reply, /819-564-9005/); // phone offered as an alternative
+  assert.doesNotMatch(reply, /viens de vous envoyer|just sent/i);
+  assert.doesNotMatch(reply, /reservit\.com|https?:\/\//i);
+});
+
+// ---- voiceDebugEnabled: never expose full PII in production -----------------
+
+test("voiceDebugEnabled requires the flag AND a non-production env", () => {
+  // Enabled only when flag === "true" and NODE_ENV is not production.
+  assert.equal(voiceDebugEnabled("true", "development"), true);
+  assert.equal(voiceDebugEnabled("true", undefined), true);
+  assert.equal(voiceDebugEnabled("true", "test"), true);
+  // Never in production, even with the flag on.
+  assert.equal(voiceDebugEnabled("true", "production"), false);
+  // Off unless the flag is exactly "true".
+  assert.equal(voiceDebugEnabled(undefined, "development"), false);
+  assert.equal(voiceDebugEnabled("1", "development"), false);
+  assert.equal(voiceDebugEnabled("TRUE", "development"), false);
 });

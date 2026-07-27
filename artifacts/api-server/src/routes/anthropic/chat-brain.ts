@@ -1,6 +1,6 @@
 import { anthropic } from "@workspace/integrations-anthropic-ai";
 import { getMotelConfig } from "@workspace/motel-config";
-import { checkAvailability } from "./availability";
+import { checkAvailability, type CheckAvailabilityFn, type CheckTimingSink } from "./availability";
 import { buildToolResults } from "./tool-results";
 import { buildSystemPrompt } from "./system-prompt";
 
@@ -57,17 +57,41 @@ function extractAssistantText(content: Array<{ type: string; text?: string }>): 
 // stalling the conversation. `allowTool` exists ONLY so the web route's
 // regenerateHonestReply can withhold the tool while correcting an already-rejected
 // link; every normal call leaves it at its default of true.
-export async function generateReply(messages: ChatMessageList, allowTool = true): Promise<string> {
+//
+// `checkAvail` is injectable so the voice route can pass a request-scoped,
+// memoized availability function (shared with the SMS orchestrator) that avoids
+// checking the same dates twice in one turn; it defaults to the real
+// checkAvailability so the web route is unchanged. `onTiming` records per-model-
+// round durations (numbers only, no PII) for latency instrumentation.
+export async function generateReply(
+  messages: ChatMessageList,
+  allowTool = true,
+  checkAvail: CheckAvailabilityFn = checkAvailability,
+  onTiming?: CheckTimingSink
+): Promise<string> {
   const working: ChatMessageList = [...messages];
   const tools = allowTool ? [CHECK_AVAILABILITY_TOOL] : undefined;
 
-  let response = await anthropic.messages.create({
-    model: MODEL,
-    max_tokens: MAX_TOKENS,
-    system: buildSystemPrompt(motel),
-    messages: working,
-    tools,
-  });
+  // Time a model round without collapsing create()'s overloads: we time a thunk
+  // so the non-streaming Message return type is inferred at the call site.
+  const timedRound = async <T>(fn: () => Promise<T>): Promise<T> => {
+    const start = Date.now();
+    try {
+      return await fn();
+    } finally {
+      onTiming?.("model_round", Date.now() - start);
+    }
+  };
+
+  let response = await timedRound(() =>
+    anthropic.messages.create({
+      model: MODEL,
+      max_tokens: MAX_TOKENS,
+      system: buildSystemPrompt(motel),
+      messages: working,
+      tools,
+    })
+  );
 
   let rounds = 0;
   while (response.stop_reason === "tool_use" && rounds < MAX_TOOL_ROUNDS) {
@@ -86,7 +110,7 @@ export async function generateReply(messages: ChatMessageList, allowTool = true)
     // any tool_use id lacks a matching tool_result.
     const toolResults = await buildToolResults(
       response.content as unknown as Parameters<typeof buildToolResults>[0],
-      checkAvailability
+      checkAvail
     );
 
     working.push({
@@ -94,23 +118,27 @@ export async function generateReply(messages: ChatMessageList, allowTool = true)
       content: toolResults as unknown as ChatMessageList[number]["content"],
     });
 
-    response = await anthropic.messages.create({
-      model: MODEL,
-      max_tokens: MAX_TOKENS,
-      system: buildSystemPrompt(motel),
-      messages: working,
-      tools,
-    });
+    response = await timedRound(() =>
+      anthropic.messages.create({
+        model: MODEL,
+        max_tokens: MAX_TOKENS,
+        system: buildSystemPrompt(motel),
+        messages: working,
+        tools,
+      })
+    );
   }
 
   // If we hit the round cap still mid-tool-use, force one final text-only reply.
   if (response.stop_reason === "tool_use") {
-    response = await anthropic.messages.create({
-      model: MODEL,
-      max_tokens: MAX_TOKENS,
-      system: buildSystemPrompt(motel),
-      messages: working,
-    });
+    response = await timedRound(() =>
+      anthropic.messages.create({
+        model: MODEL,
+        max_tokens: MAX_TOKENS,
+        system: buildSystemPrompt(motel),
+        messages: working,
+      })
+    );
   }
 
   return extractAssistantText(response.content);
